@@ -1,0 +1,280 @@
+body {
+    background-color: #f6f6f6;
+    line-height: 1.6;
+}
+
+/* 顶部导航栏 */
+.VPNav {
+    box-shadow: 0 1px 8px rgba(0, 0, 0, 0.1);
+}
+
+/* 左上角标题 */
+.VPNavBarTitle {
+    font-weight: 600;
+    letter-spacing: 0.5px;
+}
+
+@media (max-width:960px) {
+    .VPHero .name {
+        font-size: 50px !important;
+        font-weight: 700 !important;
+        letter-spacing: 1px !important;
+        padding-top: 50px !important;
+        padding-bottom: 22px !important;
+    }
+    /* Hero 副标题（text） */
+    .VPHero .text {
+        font-size: 40px !important;
+        color: #555;
+        padding-top: 10px !important;
+    }
+
+    /* Hero 描述（tagline） */
+    .VPHero .tagline {
+        font-size: 18px !important;
+        color: #888;
+        padding-top: 30px !important;
+    }
+    .VPHero .actions {
+        padding-top: 30px !important;
+        margin-top: 0px;
+    }
+}
+
+/* 主标题 */
+.VPHero .name {
+    font-size: 55px;
+    /* 字体大小 */
+    font-weight: 700;
+    /* 加粗 */
+    padding-bottom: 5px ;
+    /* 和副标题间距 */
+    letter-spacing: 1px;
+    /* 字间距 */
+}
+
+/*副标题*/
+.VPHero .text {
+    font-size: 45px;
+    color: #555;
+    padding-top: 10px;
+}
+
+/*描述 */
+.VPHero .tagline {
+    font-size: 18px;
+    color: #888;
+    padding-top: 15px;
+}
+/* 按钮 */
+.VPHero .actions {
+    padding-top: 30px;
+    margin-top: 0px;
+}
+
+/* 主按钮 */
+.VPButton.brand {
+    background-color: #3a976d;
+    border: none;
+}
+
+/* 次按钮 */
+.VPButton.alt {
+    border: 0px solid #ddd;
+}
+
+.VPButton:hover {
+    transform: translateY(-2px);
+    transition: all 0.2s ease;
+}
+
+.VPFeatures {
+    margin-top: 4px;
+}
+
+/* 单个卡片 */
+.VPFeature {
+    border-radius: 12px;
+    border: 1px solid #eee;
+    transition: all 0.2s ease;
+}
+
+/* 卡片 hover 提升效果 */
+.VPFeature:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08);
+}
+
+/* 卡片标题 */
+.VPFeature h2 {
+    font-size: 18px;
+}
+
+/* 卡片描述 */
+.VPFeature p {
+    font-size: 14px;
+    color: #666;
+}
+
+/* Markdown 内容区域 */
+/* 正文最大宽度 */
+.VPDoc {
+    max-width: 900px;
+}
+
+/* 标题样式 */
+h1,
+h2,
+h3 {
+    font-weight: 600;
+}
+
+/* 段落 */
+p {
+    font-size: 16px;
+}
+
+/* 链接 */
+a {
+    color: #3eaf7c;
+}
+
+/* 链接 hover */
+a:hover {
+    text-decoration: underline;
+}
+
+.dark {
+    body {
+        background-color: #191919;
+    }
+
+    .VPHero .text {
+        color: #d9d9d9;
+    }
+
+    .VPHero .tagline {
+        color: #999;
+    }
+
+    .VPFeature {
+        border-color: #333;
+        background-color: #111;
+    }
+}
+
+/* 头像容器 */
+.avatar-row {
+    display: flex;
+    justify-content: left;
+    gap: 20px;
+    flex-wrap: wrap;
+    /* 允许换行 */
+    padding:30px 0;
+}
+
+/* 单个头像 */
+.avatar-row img {
+    width: 100px;
+    height: 100px;
+    border-radius: 50%;
+    object-fit: cover;
+    display: block;
+    transition: transform 0.2s ease;
+}
+
+/* 放大效果 */
+.avatar-row img:hover {
+    transform: scale(1.1);
+ }
+
+@media (max-width: 960px) {
+    .avatar-row img {
+        width: 60px;
+        height: 60px;
+    }
+ 
+    .avatar-row {
+        gap: 8px;
+    }
+}
+
+/* 外层：固定位置，不参与抖动 */
+.VPHero .image {
+    width: 200px;
+    height: 200px;
+    margin: 0 auto;
+
+    display: flex;
+    justify-content: center;
+    align-items: center;
+
+    /* 隔离布局 */
+    position: relative;
+}
+
+/* 图片外壳 */
+.VPHero .image img {
+    width: 200px;
+    height: 200px;
+
+    border-radius: 50%;
+    object-fit: cover;
+
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+
+    /* 脱离布局影响 */
+    position: absolute;
+
+    /* 锁定位置 */
+    top: 72%;
+    left: 50%;
+    transform: translate(-50%, -50%) scale(1);
+
+    transition: transform 0.25s ease, box-shadow 0.25s ease;
+}
+
+/* hover */
+.VPHero .image img:hover {
+    transform: translate(-50%, -50%) scale(1.05);
+    box-shadow: 0 15px 40px rgba(0, 0, 0, 0.2);
+}
+
+@media (max-width: 960px) {
+    .VPHero .image {
+        width: 170px;
+        height: 170px;
+        margin: 0 auto;
+    
+        display: flex;
+        justify-content: center;
+        align-items: center;
+    
+        position: relative;
+    }
+    
+    .VPHero .image img {
+        margin-top: 15px;
+        width: 170px;
+        height: 170px;
+    
+        border-radius: 50%;
+        object-fit: cover;
+    
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+    
+        position: absolute;
+    
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%) scale(1);
+    
+        transition: transform 0.25s ease, box-shadow 0.25s ease;
+    }
+    
+    .VPHero .image img:hover {
+        transform: translate(-50%, -50%) scale(1.05);
+        box-shadow: 0 15px 40px rgba(0, 0, 0, 0.2);
+    }
+}
+

@@ -134,6 +134,16 @@ p {
     font-size: 16px;
 }
 
+/* get-gloves 页面整体居中显示，正文保持默认左对齐，并保留右侧目录 */
+.get-gloves-page .VPDoc {
+    max-width: 1280px;
+    margin: 0 auto;
+}
+
+.get-gloves-page .VPDoc .container {
+    margin: 0 auto;
+}
+
 /* 链接 */
 a {
     color: #3eaf7c;

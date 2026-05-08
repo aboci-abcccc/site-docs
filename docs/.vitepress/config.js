@@ -9,6 +9,23 @@ export default defineConfig({
   cleanUrls: true, 
   metaChunk: true,
   lastUpdated: true,
+  markdown: {
+    config(md) {
+      const defaultHeadingClose =
+        md.renderer.rules.heading_close ||
+        ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options))
+
+      md.renderer.rules.heading_close = (tokens, idx, options, env, self) => {
+        const result = defaultHeadingClose(tokens, idx, options, env, self)
+
+        if (tokens[idx].tag === 'h1') {
+          return `${result}<div class="article-meta-row"><UpdateTime /><ArticleMetadata /></div>`
+        }
+
+        return result
+      }
+    }
+  },
 
   themeConfig: {
     sidebar: [
@@ -30,6 +47,14 @@ export default defineConfig({
     darkModeSwitchLabel: '浅色 / 深色',
     lightModeSwitchTitle: '切换到浅色',
     darkModeSwitchTitle: '切换到深色', 
+    sidebarMenuLabel: '菜单',
+    returnToTopLabel: '返回顶部',
+    outline: {
+      label: '本页目录'
+    },
+    lastUpdated: {
+      text: '上次更新时间'
+    },
     // 搜索 汉化
     search: {
       provider: 'local',

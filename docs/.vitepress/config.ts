@@ -50,10 +50,6 @@ export default defineConfig({
           }
         }
       }
-    },
-    footer: {
-      message: '津 ICP 备 2026004483 号 - 1',
-      copyright: '© 2026 _abcccc. All Rights Reserved.'
     }
   },
   head: [

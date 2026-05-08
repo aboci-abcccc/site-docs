@@ -154,6 +154,19 @@ a:hover {
     text-decoration: underline;
 }
 
+/* Lumen 页脚：备案信息与版权信息分两行显示 */
+.footer-info {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+}
+
+.footer-info .info-spacing,
+.footer-info .info-spacing-copyright {
+    display: none;
+}
+
 .dark {
     body {
         background-color: #191919;

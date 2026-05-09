@@ -7,7 +7,7 @@ import 'vue-pdf-embed/dist/styles/textLayer.css'
 const VuePdfEmbed = defineAsyncComponent(async () => {
   const [{ default: component, GlobalWorkerOptions }, { default: workerSrc }] = await Promise.all([
     import('vue-pdf-embed/dist/index.essential.mjs'),
-    import('pdfjs-dist/build/pdf.worker.min.mjs?url')
+    import('pdfjs-dist/build/pdf.worker.min.mjs?worker&url')
   ])
 
   GlobalWorkerOptions.workerSrc = workerSrc

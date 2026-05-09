@@ -26,6 +26,35 @@ export default defineConfig({
       };
     },
   },
+  vite: {
+    build: {
+      modulePreload: {
+        polyfill: true,
+      },
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            const normalizedId = id.replaceAll("\\", "/");
+
+            if (normalizedId.includes("/node_modules/pdfjs-dist/")) {
+              return "pdfjs";
+            }
+
+            if (normalizedId.includes("/node_modules/vue-pdf-embed/")) {
+              return "vue-pdf-embed";
+            }
+
+            if (
+              normalizedId.includes("/node_modules/leafer-ui/") ||
+              normalizedId.includes("/node_modules/@leafer")
+            ) {
+              return "leafer";
+            }
+          },
+        },
+      },
+    },
+  },
 
   themeConfig: {
     sidebar: [

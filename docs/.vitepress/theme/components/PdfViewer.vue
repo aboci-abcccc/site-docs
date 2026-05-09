@@ -1,3 +1,57 @@
+<script lang="ts">
+type PdfEmbedRuntime = {
+  component: any
+}
+
+let pdfEmbedRuntimePromise: Promise<PdfEmbedRuntime> | null = null
+let leaferRuntimePromise: Promise<typeof import('leafer-ui')> | null = null
+let leaferPreloadScheduled = false
+
+function loadPdfEmbedRuntime() {
+  pdfEmbedRuntimePromise ??= Promise.all([
+    import('vue-pdf-embed/dist/index.essential.mjs'),
+    import('pdfjs-dist/build/pdf.worker.min.mjs?worker&url')
+  ]).then(([{ default: component, GlobalWorkerOptions }, { default: workerSrc }]) => {
+    GlobalWorkerOptions.workerSrc = workerSrc
+
+    return { component }
+  })
+
+  return pdfEmbedRuntimePromise
+}
+
+function loadLeaferRuntime() {
+  leaferRuntimePromise ??= import('leafer-ui')
+
+  return leaferRuntimePromise
+}
+
+function preloadPdfViewerRuntime() {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  void loadPdfEmbedRuntime()
+
+  if (leaferPreloadScheduled) {
+    return
+  }
+
+  leaferPreloadScheduled = true
+
+  const preloadLeafer = () => {
+    void loadLeaferRuntime()
+  }
+
+  if ('requestIdleCallback' in window) {
+    window.requestIdleCallback(preloadLeafer, { timeout: 2000 })
+    return
+  }
+
+  window.setTimeout(preloadLeafer, 800)
+}
+</script>
+
 <script setup lang="ts">
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { withBase } from 'vitepress'
@@ -5,12 +59,7 @@ import 'vue-pdf-embed/dist/styles/annotationLayer.css'
 import 'vue-pdf-embed/dist/styles/textLayer.css'
 
 const VuePdfEmbed = defineAsyncComponent(async () => {
-  const [{ default: component, GlobalWorkerOptions }, { default: workerSrc }] = await Promise.all([
-    import('vue-pdf-embed/dist/index.essential.mjs'),
-    import('pdfjs-dist/build/pdf.worker.min.mjs?worker&url')
-  ])
-
-  GlobalWorkerOptions.workerSrc = workerSrc
+  const { component } = await loadPdfEmbedRuntime()
 
   return component
 })
@@ -22,6 +71,7 @@ const THUMBNAIL_ROW_HEIGHT = 148
 const THUMBNAIL_BUFFER = 2
 const THUMBNAIL_CARD_WIDTH = 128
 const THUMBNAIL_PAPER_WIDTH = 92
+const PDF_RANGE_CHUNK_SIZE = 256 * 1024
 
 type SidebarMode = 'outline' | 'thumbs'
 type ZoomValue = 'auto' | string
@@ -82,7 +132,16 @@ const props = withDefaults(
   }
 )
 
-const pdfSource = computed(() => withBase(props.src))
+preloadPdfViewerRuntime()
+
+const pdfSourceUrl = computed(() => withBase(props.src))
+const pdfSource = computed(() => ({
+  url: pdfSourceUrl.value,
+  disableRange: false,
+  disableStream: true,
+  disableAutoFetch: true,
+  rangeChunkSize: PDF_RANGE_CHUNK_SIZE
+}))
 const pdfDoc = shallowRef<PdfDocumentProxyLike | null>(null)
 const currentPage = ref(1)
 const pageInput = ref('1')
@@ -443,13 +502,13 @@ function toggleFullscreen() {
 
 function downloadPdf() {
   const link = document.createElement('a')
-  link.href = pdfSource.value
+  link.href = pdfSourceUrl.value
   link.download = props.title || 'document.pdf'
   link.click()
 }
 
 function printPdf() {
-  window.open(pdfSource.value, '_blank')
+  window.open(pdfSourceUrl.value, '_blank')
 }
 
 function scheduleApplyRenderWidth(width: number | undefined) {
@@ -719,7 +778,7 @@ async function renderThumbnailCanvas() {
   }
 
   try {
-    const { Leafer, Rect, Text, Image: LeaferImage } = (await import('leafer-ui')) as any
+    const { Leafer, Rect, Text, Image: LeaferImage } = (await loadLeaferRuntime()) as any
     const width = Math.max(160, container.clientWidth || 190)
     const height = thumbnailViewportCanvasHeight.value
     const visiblePages = visibleThumbnailPages.value
@@ -1069,7 +1128,7 @@ onBeforeUnmount(() => {
                     annotation-layer
                     text-layer
                     class="pdf-viewer-document"
-                    :key="`${pdfSource}-${renderKey}-${page}`"
+                    :key="`${pdfSourceUrl}-${renderKey}-${page}`"
                     :source="pdfDoc"
                     :page="page"
                     :width="appliedRenderWidth"

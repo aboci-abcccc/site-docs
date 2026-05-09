@@ -17,6 +17,9 @@
     "vitepress": "^1.6.4"
   },
   "dependencies": {
-    "@theojs/lumen": "^6.4.6"
+    "@theojs/lumen": "^6.4.6",
+    "leafer-ui": "2.1.0",
+    "pdfjs-dist": "4.10.38",
+    "vue-pdf-embed": "^2.1.4"
   }
 }

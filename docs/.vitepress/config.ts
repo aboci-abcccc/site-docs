@@ -9,6 +9,23 @@ export default defineConfig({
   cleanUrls: true,
   metaChunk: true,
   lastUpdated: true,
+  markdown: {
+    config(md) {
+      const defaultHeadingClose =
+        md.renderer.rules.heading_close ||
+        ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options));
+
+      md.renderer.rules.heading_close = (tokens, idx, options, env, self) => {
+        const result = defaultHeadingClose(tokens, idx, options, env, self);
+
+        if (tokens[idx].tag === "h1") {
+          return `${result}<div class="article-meta-row"><UpdateTime /><ArticleMetadata /></div>`;
+        }
+
+        return result;
+      };
+    },
+  },
 
   themeConfig: {
     sidebar: [
@@ -23,7 +40,7 @@ export default defineConfig({
       },
     ],
     outline: {
-      label: "索引",
+      label: "本页目录",
     },
     docFooter: {
       prev: "上一页",
@@ -33,9 +50,11 @@ export default defineConfig({
       pattern: "https://github.com/aboci-abcccc/site-docs/tree/main/docs/:path",
       text: "在 GitHub 上编辑此页",
     },
-
-    returnToTopLabel: "回到顶部",
-    lastUpdatedText: "上次更新时间",
+    sidebarMenuLabel: "菜单",
+    returnToTopLabel: "返回顶部",
+    lastUpdated: {
+      text: "上次更新时间",
+    },
 
     nav: [
       { text: "首页", link: "/" },
@@ -65,10 +84,6 @@ export default defineConfig({
           },
         },
       },
-    },
-    footer: {
-      message: "津 ICP 备 2026004483 号 - 1",
-      copyright: "© 2026 _abcccc. All Rights Reserved.",
     },
   },
   head: [

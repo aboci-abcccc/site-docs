@@ -1,1 +1,38 @@
+# 依赖
 node_modules/
+.pnpm-store/
+.yarn/
+.npm/
+
+# 构建产物
+dist/
+.vitepress/dist/
+.vitepress/cache/
+.temp/
+docs/.vitepress/dist
+
+# 日志
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 编辑器
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 系统文件
+Thumbs.db

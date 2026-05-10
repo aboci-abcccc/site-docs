@@ -71,11 +71,17 @@ const THUMBNAIL_ROW_HEIGHT = 148
 const THUMBNAIL_BUFFER = 2
 const THUMBNAIL_CARD_WIDTH = 128
 const THUMBNAIL_PAPER_WIDTH = 92
-const PDF_RANGE_CHUNK_SIZE = 256 * 1024
+const PDF_DOWNLOAD_CHUNK_SIZE = 512 * 1024
+const PDF_DOWNLOAD_CONCURRENCY = 8
 
 type SidebarMode = 'outline' | 'thumbs'
 type ZoomValue = 'auto' | string
 type PdfDestination = unknown[] | string | null | undefined
+type PdfBinarySource = { data: Uint8Array }
+type PdfContentInfo = {
+  size: number
+  supportsRange: boolean
+}
 
 type PdfOutlineItem = {
   title?: string
@@ -135,13 +141,12 @@ const props = withDefaults(
 preloadPdfViewerRuntime()
 
 const pdfSourceUrl = computed(() => withBase(props.src))
-const pdfSource = computed(() => ({
-  url: pdfSourceUrl.value,
-  disableRange: false,
-  disableStream: true,
-  disableAutoFetch: true,
-  rangeChunkSize: PDF_RANGE_CHUNK_SIZE
-}))
+const pdfBinaryData = shallowRef<Uint8Array | null>(null)
+const pdfSource = computed<PdfBinarySource | null>(() => {
+  const data = pdfBinaryData.value
+
+  return data ? { data } : null
+})
 const pdfDoc = shallowRef<PdfDocumentProxyLike | null>(null)
 const currentPage = ref(1)
 const pageInput = ref('1')
@@ -151,6 +156,9 @@ const isSidebarOpen = ref(false)
 const outline = ref<OutlineEntry[]>([])
 const isOutlineLoading = ref(false)
 const loadError = ref('')
+const isPdfDownloading = ref(false)
+const pdfDownloadLoaded = ref(0)
+const pdfDownloadTotal = ref(0)
 const zoomValue = ref<ZoomValue>('auto')
 const basePageWidth = ref(720)
 const basePageHeight = ref(1018)
@@ -178,6 +186,8 @@ let thumbnailMetricsFrame = 0
 let scrollSyncTimer = 0
 let thumbnailRenderVersion = 0
 let scrollLockApplied = false
+let pdfDownloadAbortController: AbortController | null = null
+let pdfDownloadRunId = 0
 
 const thumbnailImageCache = new Map<number, string>()
 const thumbnailPendingPages = new Set<number>()
@@ -207,6 +217,37 @@ const zoomSelectLabel = computed(() =>
 const isPresetZoomSelected = computed(() =>
   zoomValue.value === 'auto' || ZOOM_PRESETS.includes(zoomValue.value as (typeof ZOOM_PRESETS)[number])
 )
+const pdfDownloadPercent = computed(() => {
+  if (pdfDownloadTotal.value <= 0) {
+    return 0
+  }
+
+  return Math.min(100, Math.round((pdfDownloadLoaded.value / pdfDownloadTotal.value) * 100))
+})
+const pdfDownloadSizeLabel = computed(() => {
+  if (pdfDownloadTotal.value > 0) {
+    return `${formatFileSize(pdfDownloadLoaded.value)} / ${formatFileSize(pdfDownloadTotal.value)}`
+  }
+
+  if (pdfDownloadLoaded.value > 0) {
+    return `${formatFileSize(pdfDownloadLoaded.value)} 已下载`
+  }
+
+  return ''
+})
+const pdfLoadingText = computed(() => {
+  if (isPdfDownloading.value) {
+    return pdfDownloadTotal.value > 0
+      ? `正在加载中 ${pdfDownloadPercent.value}%`
+      : '正在加载中...'
+  }
+
+  if (pdfBinaryData.value && !pdfDoc.value) {
+    return 'PDF 解析中...'
+  }
+
+  return 'PDF 加载中...'
+})
 
 const renderWidth = computed(() => {
   if (zoomValue.value === 'auto') {
@@ -308,21 +349,15 @@ watch([isSidebarOpen, sidebarMode, pageCount], () => {
 })
 
 watch(
-  () => props.src,
+  pdfSourceUrl,
   () => {
-    pdfDoc.value = null
-    currentPage.value = 1
-    pageInput.value = '1'
-    pageCount.value = 0
-    outline.value = []
-    loadError.value = ''
-    zoomValue.value = 'auto'
-    isSidebarOpen.value = false
-    scrollTop.value = 0
-    renderKey.value += 1
-    clearThumbnailCache()
-    destroyThumbnailLeafer()
-  }
+    resetPdfViewerState()
+
+    if (typeof window !== 'undefined') {
+      void startPdfDownload()
+    }
+  },
+  { immediate: true }
 )
 
 function clampPage(page: number) {
@@ -337,6 +372,341 @@ function clampZoomScale(scale: number) {
 
 function formatZoomValue(scale: number): ZoomValue {
   return String(Math.round(clampZoomScale(scale) * 100) / 100)
+}
+
+function formatFileSize(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return '0 B'
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB'] as const
+  let value = bytes
+  let unitIndex = 0
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+
+  if (unitIndex === 0) {
+    return `${Math.round(value)} ${units[unitIndex]}`
+  }
+
+  return `${value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${units[unitIndex]}`
+}
+
+function parseContentLength(value: string | null) {
+  const length = Number(value)
+
+  return Number.isFinite(length) && length > 0 ? length : 0
+}
+
+function parseContentRangeTotal(value: string | null) {
+  if (!value) {
+    return 0
+  }
+
+  const match = value.match(/\/(\d+)$/)
+  const total = match ? Number(match[1]) : 0
+
+  return Number.isFinite(total) && total > 0 ? total : 0
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof DOMException
+    ? error.name === 'AbortError'
+    : error instanceof Error && error.name === 'AbortError'
+}
+
+function getErrorMessage(error: unknown) {
+  if (error instanceof Error && error.message) {
+    return error.message
+  }
+
+  return '未知错误'
+}
+
+function resetPdfViewerState() {
+  pdfDownloadRunId += 1
+  pdfDownloadAbortController?.abort()
+  pdfDownloadAbortController = null
+  pdfBinaryData.value = null
+  isPdfDownloading.value = false
+  pdfDownloadLoaded.value = 0
+  pdfDownloadTotal.value = 0
+  pdfDoc.value = null
+  currentPage.value = 1
+  pageInput.value = '1'
+  pageCount.value = 0
+  outline.value = []
+  loadError.value = ''
+  zoomValue.value = 'auto'
+  isSidebarOpen.value = false
+  scrollTop.value = 0
+  thumbnailScrollTop.value = 0
+  thumbnailViewportHeight.value = 0
+  renderKey.value += 1
+  clearThumbnailCache()
+  destroyThumbnailLeafer()
+  cleanupObservers()
+}
+
+async function startPdfDownload() {
+  const controller = new AbortController()
+  const runId = ++pdfDownloadRunId
+
+  pdfDownloadAbortController?.abort()
+  pdfDownloadAbortController = controller
+  pdfBinaryData.value = null
+  pdfDoc.value = null
+  isPdfDownloading.value = true
+  pdfDownloadLoaded.value = 0
+  pdfDownloadTotal.value = 0
+  loadError.value = ''
+
+  const reportProgress = (loaded: number, total: number) => {
+    if (runId !== pdfDownloadRunId || controller.signal.aborted) {
+      return
+    }
+
+    pdfDownloadLoaded.value = loaded
+    pdfDownloadTotal.value = total
+  }
+
+  try {
+    const data = await downloadPdfSource(pdfSourceUrl.value, controller.signal, reportProgress)
+
+    if (runId !== pdfDownloadRunId || controller.signal.aborted) {
+      return
+    }
+
+    pdfBinaryData.value = data
+    pdfDownloadLoaded.value = data.byteLength
+    pdfDownloadTotal.value = data.byteLength
+  } catch (error) {
+    if (controller.signal.aborted || isAbortError(error) || runId !== pdfDownloadRunId) {
+      return
+    }
+
+    loadError.value = `PDF 分片下载失败：${getErrorMessage(error)}`
+  } finally {
+    if (runId === pdfDownloadRunId) {
+      isPdfDownloading.value = false
+      pdfDownloadAbortController = null
+    }
+  }
+}
+
+async function downloadPdfSource(
+  url: string,
+  signal: AbortSignal,
+  onProgress: (loaded: number, total: number) => void
+) {
+  const info = await fetchPdfContentInfo(url, signal)
+
+  if (info?.size) {
+    onProgress(0, info.size)
+  }
+
+  if (info && info.supportsRange && info.size > PDF_DOWNLOAD_CHUNK_SIZE) {
+    try {
+      return await downloadPdfByChunks(url, info.size, signal, onProgress)
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) {
+        throw error
+      }
+
+      console.warn('PDF 分片下载失败，回退为完整下载。', error)
+    }
+  }
+
+  return downloadPdfFully(url, signal, info?.size ?? 0, onProgress)
+}
+
+async function fetchPdfContentInfo(url: string, signal: AbortSignal): Promise<PdfContentInfo | null> {
+  let size = 0
+  let supportsRange = false
+
+  try {
+    const response = await fetch(url, {
+      method: 'HEAD',
+      signal
+    })
+
+    if (response.ok) {
+      size = parseContentLength(response.headers.get('content-length'))
+      supportsRange = response.headers.get('accept-ranges')?.toLowerCase().includes('bytes') ?? false
+    }
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error
+    }
+  }
+
+  if (!supportsRange) {
+    const rangeInfo = await probePdfRangeSupport(url, signal, size)
+
+    if (rangeInfo) {
+      return rangeInfo
+    }
+  }
+
+  return size > 0 ? { size, supportsRange } : null
+}
+
+async function probePdfRangeSupport(
+  url: string,
+  signal: AbortSignal,
+  sizeHint = 0
+): Promise<PdfContentInfo | null> {
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Range: 'bytes=0-0'
+      },
+      signal
+    })
+
+    if (response.status === 206) {
+      await response.arrayBuffer()
+
+      const size = parseContentRangeTotal(response.headers.get('content-range')) || sizeHint
+
+      return size > 0 ? { size, supportsRange: true } : null
+    }
+
+    await response.body?.cancel()
+
+    if (response.ok) {
+      const size = parseContentLength(response.headers.get('content-length')) || sizeHint
+
+      return size > 0 ? { size, supportsRange: false } : null
+    }
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error
+    }
+  }
+
+  return sizeHint > 0 ? { size: sizeHint, supportsRange: false } : null
+}
+
+async function downloadPdfByChunks(
+  url: string,
+  totalSize: number,
+  signal: AbortSignal,
+  onProgress: (loaded: number, total: number) => void
+) {
+  const chunkCount = Math.ceil(totalSize / PDF_DOWNLOAD_CHUNK_SIZE)
+  const chunks = new Array<Uint8Array>(chunkCount)
+  let nextChunkIndex = 0
+  let loaded = 0
+
+  async function downloadNextChunk() {
+    while (nextChunkIndex < chunkCount) {
+      const chunkIndex = nextChunkIndex++
+      const start = chunkIndex * PDF_DOWNLOAD_CHUNK_SIZE
+      const end = Math.min(totalSize - 1, start + PDF_DOWNLOAD_CHUNK_SIZE - 1)
+      const chunk = await downloadPdfChunk(url, start, end, signal)
+
+      chunks[chunkIndex] = chunk
+      loaded += chunk.byteLength
+      onProgress(loaded, totalSize)
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(PDF_DOWNLOAD_CONCURRENCY, chunkCount) }, () => downloadNextChunk())
+  )
+
+  const data = new Uint8Array(totalSize)
+  let offset = 0
+
+  for (const chunk of chunks) {
+    if (!chunk) {
+      throw new Error('PDF 分片缺失')
+    }
+
+    data.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+
+  onProgress(data.byteLength, totalSize)
+
+  return data
+}
+
+async function downloadPdfChunk(url: string, start: number, end: number, signal: AbortSignal) {
+  const response = await fetch(url, {
+    headers: {
+      Range: `bytes=${start}-${end}`
+    },
+    signal
+  })
+
+  if (response.status !== 206) {
+    await response.body?.cancel()
+    throw new Error(`服务器未返回分片数据（HTTP ${response.status}）`)
+  }
+
+  const chunk = new Uint8Array(await response.arrayBuffer())
+  const expectedLength = end - start + 1
+
+  if (chunk.byteLength !== expectedLength) {
+    throw new Error(`分片大小不匹配：${chunk.byteLength}/${expectedLength}`)
+  }
+
+  return chunk
+}
+
+async function downloadPdfFully(
+  url: string,
+  signal: AbortSignal,
+  totalHint: number,
+  onProgress: (loaded: number, total: number) => void
+) {
+  const response = await fetch(url, { signal })
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`)
+  }
+
+  const total = parseContentLength(response.headers.get('content-length')) || totalHint
+
+  if (!response.body) {
+    const data = new Uint8Array(await response.arrayBuffer())
+    onProgress(data.byteLength, total || data.byteLength)
+
+    return data
+  }
+
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let loaded = 0
+
+  while (true) {
+    const { done, value } = await reader.read()
+
+    if (done) {
+      break
+    }
+
+    chunks.push(value)
+    loaded += value.byteLength
+    onProgress(loaded, total || loaded)
+  }
+
+  const data = new Uint8Array(loaded)
+  let offset = 0
+
+  for (const chunk of chunks) {
+    data.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+
+  onProgress(data.byteLength, total || data.byteLength)
+
+  return data
 }
 
 function getPageTop(page: number) {
@@ -989,6 +1359,9 @@ watch(isFullscreen, (locked) => {
 }, { immediate: true })
 
 onBeforeUnmount(() => {
+  pdfDownloadRunId += 1
+  pdfDownloadAbortController?.abort()
+  pdfDownloadAbortController = null
   cleanupObservers()
   destroyThumbnailLeafer()
   if (scrollLockApplied) {
@@ -1089,7 +1462,9 @@ onBeforeUnmount(() => {
             </div>
             <div v-else class="pdf-viewer-page-wrap">
               <VuePdfEmbed
+                v-if="pdfSource"
                 class="pdf-viewer-loader-document"
+                :key="`loader-${pdfSourceUrl}`"
                 :source="pdfSource"
                 :page="1"
                 :width="1"
@@ -1102,7 +1477,11 @@ onBeforeUnmount(() => {
                 <svg class="pdf-viewer-spinner" width="32" height="32" viewBox="0 0 32 32" fill="none">
                   <circle cx="16" cy="16" r="12" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-dasharray="60 15"/>
                 </svg>
-                <span>PDF 加载中...</span>
+                <span>{{ pdfLoadingText }}</span>
+                <div v-if="isPdfDownloading" class="pdf-viewer-download-progress" aria-hidden="true">
+                  <span :style="{ width: `${pdfDownloadPercent}%` }" />
+                </div>
+                <small v-if="pdfDownloadSizeLabel">{{ pdfDownloadSizeLabel }}</small>
               </div>
 
               <div

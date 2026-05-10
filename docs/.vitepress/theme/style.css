@@ -642,6 +642,28 @@ body.pdf-viewer-lock-scroll {
     color: rgba(255, 255, 255, 0.78);
 }
 
+.pdf-viewer-loading small {
+    color: rgba(255, 255, 255, 0.58);
+    font-size: 12px;
+}
+
+.pdf-viewer-download-progress {
+    overflow: hidden;
+    width: min(280px, 72vw);
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.16);
+}
+
+.pdf-viewer-download-progress span {
+    display: block;
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #3a976d, #70d49f);
+    transition: width 0.18s ease;
+}
+
 .pdf-viewer-error,
 .pdf-viewer-fallback {
     display: flex;

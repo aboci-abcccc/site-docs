@@ -966,3 +966,74 @@ body.pdf-viewer-lock-scroll {
 .marker-evy:hover::after {
     top: 0;
 }
+
+/* 导航栏毛玻璃 */
+.VPNavBar:not(.has-sidebar):not(.home.top) {
+    background-color: rgba(255, 255, 255, 0);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+.dark .VPNavBar:not(.has-sidebar):not(.home.top) {
+    background-color: rgba(0, 0, 0, 0);
+}
+
+.DocSearch-Button {
+    background-color: rgba(255, 255, 255, 0);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+.VPFeature {
+    border: 1px solid transparent;
+    box-shadow: 0 10px 30px 0 rgb(0 0 0 / 15%);
+    background-color: transparent;
+}
+
+.curtain {
+    background-color: rgba(255, 255, 255, 0);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+@media (min-width: 960px) {
+    .VPNavBar:not(.home.top) .content-body {
+        background-color: rgba(255, 255, 255, 0);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+    }
+}
+
+.VPLocalNav {
+    background-color: rgba(255, 255, 255, 0);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+/* 隐藏横条 */
+@media (min-width: 960px) {
+    .VPNavBarTitle.has-sidebar .title {
+        border-bottom-color: transparent;
+    }
+}
+
+.VPFooter {
+    border-top: none;
+}
+
+.VPNavBar.screen-open {
+    border-bottom: none;
+}
+
+.VPNavScreenMenuLink,
+.VPNavScreenMenuGroup,
+.VPLocalNav {
+    border-bottom: none;
+}
+
+.VPNavBar .divider,
+.VPNavBarTitle .divider,
+.VPNavBarMenu .divider,
+.divider {
+    display: none;
+}

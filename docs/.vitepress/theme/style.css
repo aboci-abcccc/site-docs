@@ -642,6 +642,28 @@ body.pdf-viewer-lock-scroll {
     color: rgba(255, 255, 255, 0.78);
 }
 
+.pdf-viewer-loading small {
+    color: rgba(255, 255, 255, 0.58);
+    font-size: 12px;
+}
+
+.pdf-viewer-download-progress {
+    overflow: hidden;
+    width: min(280px, 72vw);
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.16);
+}
+
+.pdf-viewer-download-progress span {
+    display: block;
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #3a976d, #70d49f);
+    transition: width 0.18s ease;
+}
+
 .pdf-viewer-error,
 .pdf-viewer-fallback {
     display: flex;
@@ -916,4 +938,124 @@ body.pdf-viewer-lock-scroll {
         height: 18px;
         margin: 0 4px;
     }
+}
+
+/* 记号笔 */
+.marker-text {
+    text-decoration: underline;
+    text-decoration-thickness: 0.55em;
+    text-decoration-color: rgba(255, 228, 0, 0.4);
+    text-underline-offset: -0.18em;
+    text-decoration-skip-ink: none;
+}
+
+/* 荧光笔 */
+.marker-text-highlight {
+    border-radius: 5px;
+    color: var(--vp-c-text-1);
+    background:
+        linear-gradient(104deg,
+            rgba(130, 255, 173, 0) 0.9%,
+            rgba(130, 255, 173, 0.85) 2.4%,
+            rgba(130, 255, 173, 0.5) 5.8%,
+            rgba(130, 255, 173, 0.1) 93%,
+            rgba(130, 255, 173, 0.7) 96%,
+            rgba(130, 255, 173, 0) 98%),
+        linear-gradient(183deg,
+            rgba(130, 255, 173, 0) 0%,
+            rgba(130, 255, 173, 0.3) 7.9%,
+            rgba(130, 255, 173, 0) 15%);
+}
+
+/* hover 记号笔 */
+.marker-evy {
+    position: relative;
+    z-index: 0;
+}
+
+.marker-evy::after {
+    content: "";
+    position: absolute;
+    z-index: -1;
+    top: 66%;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    transition: top 200ms cubic-bezier(0, 0.8, 0.13, 1);
+    background-color: rgba(79, 192, 141, 0.5);
+}
+
+.marker-evy:hover::after {
+    top: 0;
+}
+
+/* 导航栏毛玻璃 */
+.VPNavBar:not(.has-sidebar):not(.home.top) {
+    background-color: rgba(255, 255, 255, 0);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+.dark .VPNavBar:not(.has-sidebar):not(.home.top) {
+    background-color: rgba(0, 0, 0, 0);
+}
+
+.DocSearch-Button {
+    background-color: rgba(255, 255, 255, 0);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+.VPFeature {
+    border: 1px solid transparent;
+    box-shadow: 0 10px 30px 0 rgb(0 0 0 / 15%);
+    background-color: transparent;
+}
+
+.curtain {
+    background-color: rgba(255, 255, 255, 0);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+@media (min-width: 960px) {
+    .VPNavBar:not(.home.top) .content-body {
+        background-color: rgba(255, 255, 255, 0);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+    }
+}
+
+.VPLocalNav {
+    background-color: rgba(255, 255, 255, 0);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+/* 隐藏横条 */
+@media (min-width: 960px) {
+    .VPNavBarTitle.has-sidebar .title {
+        border-bottom-color: transparent;
+    }
+}
+
+.VPFooter {
+    border-top: none;
+}
+
+.VPNavBar.screen-open {
+    border-bottom: none;
+}
+
+.VPNavScreenMenuLink,
+.VPNavScreenMenuGroup,
+.VPLocalNav {
+    border-bottom: none;
+}
+
+.VPNavBar .divider,
+.VPNavBarTitle .divider,
+.VPNavBarMenu .divider,
+.divider {
+    display: none;
 }

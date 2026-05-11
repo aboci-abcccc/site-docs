@@ -1,0 +1,127 @@
+name: Deploy VitePress
+
+on:
+  push:
+    tags:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      RELEASE_ASSET: site-docs-dist.tar.gz
+      DEPLOY_TAG: deploy-${{ github.run_id }}-${{ github.run_attempt }}
+      DEPLOY_TARGET: /var/www/main/dist
+      GITHUB_MIRROR: https://gh.fhjhy.top
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build site
+        run: pnpm run docs:build
+
+      - name: Verify build output
+        run: |
+          test -f docs/.vitepress/dist/index.html
+          test -d docs/.vitepress/dist/assets
+
+      - name: Pack build output
+        run: |
+          printf '%s\n' "${GITHUB_SHA}" > docs/.vitepress/dist/.deploy-sha
+          tar -czf "${RELEASE_ASSET}" -C docs/.vitepress/dist .
+          sha256sum "${RELEASE_ASSET}" > "${RELEASE_ASSET}.sha256"
+          tar -tzf "${RELEASE_ASSET}" >/dev/null
+          ls -lh "${RELEASE_ASSET}" "${RELEASE_ASSET}.sha256"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${DEPLOY_TAG}" \
+            "${RELEASE_ASSET}" \
+            "${RELEASE_ASSET}.sha256" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "Site Docs Deploy ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" \
+            --notes "Automated deployment package for ${GITHUB_SHA}." \
+            --latest
+
+      - name: Pull release on server and update site
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            set -eu
+
+            ASSET="${{ env.RELEASE_ASSET }}"
+            DEPLOY_TAG="${{ env.DEPLOY_TAG }}"
+            DEPLOY_TARGET="${{ env.DEPLOY_TARGET }}"
+            MIRROR="${{ env.GITHUB_MIRROR }}"
+            REPO="${{ github.repository }}"
+
+            case "${DEPLOY_TARGET}" in
+              ""|"/")
+                echo "Invalid DEPLOY_TARGET: ${DEPLOY_TARGET}" >&2
+                exit 1
+                ;;
+            esac
+
+            TMP_DIR="$(mktemp -d)"
+            cleanup() {
+              rm -rf "${TMP_DIR}"
+            }
+            trap cleanup EXIT
+
+            DOWNLOAD_URL="${MIRROR%/}/https://github.com/${REPO}/releases/download/${DEPLOY_TAG}/${ASSET}"
+            SHA256_URL="${DOWNLOAD_URL}.sha256"
+
+            echo "Download release package from ${DOWNLOAD_URL}"
+            if command -v curl >/dev/null 2>&1; then
+              curl -fL --retry 5 --retry-delay 2 -o "${TMP_DIR}/${ASSET}" "${DOWNLOAD_URL}"
+              curl -fL --retry 5 --retry-delay 2 -o "${TMP_DIR}/${ASSET}.sha256" "${SHA256_URL}"
+            else
+              wget -O "${TMP_DIR}/${ASSET}" "${DOWNLOAD_URL}"
+              wget -O "${TMP_DIR}/${ASSET}.sha256" "${SHA256_URL}"
+            fi
+
+            cd "${TMP_DIR}"
+            sha256sum -c "${ASSET}.sha256"
+
+            mkdir -p site "${DEPLOY_TARGET}"
+            tar -xzf "${ASSET}" -C site
+
+            if command -v rsync >/dev/null 2>&1; then
+              rsync -a --delete site/ "${DEPLOY_TARGET}/"
+            else
+              find "${DEPLOY_TARGET}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+              cp -a site/. "${DEPLOY_TARGET}/"
+            fi
+
+            echo "Updated ${DEPLOY_TARGET} to $(cat "${DEPLOY_TARGET}/.deploy-sha")"

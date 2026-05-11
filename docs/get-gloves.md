@@ -3,7 +3,7 @@ layout: doc
 pageClass: get-gloves-page
 navbar: false
 sidebar: false
-prev: false
+prev: true
 next: false
 ---
 

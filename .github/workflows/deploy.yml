@@ -21,7 +21,6 @@ jobs:
       RELEASE_ASSET: site-docs-dist.tar.gz
       DEPLOY_TAG: deploy-${{ github.run_id }}-${{ github.run_attempt }}
       DEPLOY_TARGET: /var/www/main/dist
-      GITHUB_MIRROR: https://gh.fhjhy.top
 
     steps:
       - name: Checkout code
@@ -83,7 +82,6 @@ jobs:
             ASSET="${{ env.RELEASE_ASSET }}"
             DEPLOY_TAG="${{ env.DEPLOY_TAG }}"
             DEPLOY_TARGET="${{ env.DEPLOY_TARGET }}"
-            MIRROR="${{ env.GITHUB_MIRROR }}"
             REPO="${{ github.repository }}"
 
             case "${DEPLOY_TARGET}" in
@@ -99,17 +97,51 @@ jobs:
             }
             trap cleanup EXIT
 
-            DOWNLOAD_URL="${MIRROR%/}/https://github.com/${REPO}/releases/download/${DEPLOY_TAG}/${ASSET}"
-            SHA256_URL="${DOWNLOAD_URL}.sha256"
+            RELEASE_PATH="${REPO}/releases/download/${DEPLOY_TAG}/${ASSET}"
+            DOWNLOAD_URLS="
+            https://gh.felicity.ac.cn/https://github.com/${RELEASE_PATH}
+            https://kkgithub.com/${RELEASE_PATH}
+            https://gh.927223.xyz/https://github.com/${RELEASE_PATH}
+            https://github.com/${RELEASE_PATH}
+            "
 
-            echo "Download release package from ${DOWNLOAD_URL}"
-            if command -v curl >/dev/null 2>&1; then
-              curl -fL --retry 5 --retry-delay 2 -o "${TMP_DIR}/${ASSET}" "${DOWNLOAD_URL}"
-              curl -fL --retry 5 --retry-delay 2 -o "${TMP_DIR}/${ASSET}.sha256" "${SHA256_URL}"
-            else
-              wget -O "${TMP_DIR}/${ASSET}" "${DOWNLOAD_URL}"
-              wget -O "${TMP_DIR}/${ASSET}.sha256" "${SHA256_URL}"
-            fi
+            download_one() {
+              url="$1"
+              output="$2"
+
+              if command -v curl >/dev/null 2>&1; then
+                if command -v timeout >/dev/null 2>&1; then
+                  timeout 120s curl -fL --connect-timeout 20 --max-time 120 --retry 2 --retry-delay 2 --retry-connrefused -o "${output}" "${url}"
+                else
+                  curl -fL --connect-timeout 20 --max-time 120 --retry 2 --retry-delay 2 --retry-connrefused -o "${output}" "${url}"
+                fi
+              elif command -v timeout >/dev/null 2>&1; then
+                timeout 120s wget --timeout=120 --tries=2 -O "${output}" "${url}"
+              else
+                wget --timeout=120 --tries=2 -O "${output}" "${url}"
+              fi
+            }
+
+            download_release_files() {
+              for DOWNLOAD_URL in ${DOWNLOAD_URLS}; do
+                SHA256_URL="${DOWNLOAD_URL}.sha256"
+
+                echo "Download release package from ${DOWNLOAD_URL}"
+                rm -f "${TMP_DIR}/${ASSET}" "${TMP_DIR}/${ASSET}.sha256"
+
+                if download_one "${DOWNLOAD_URL}" "${TMP_DIR}/${ASSET}" && \
+                   download_one "${SHA256_URL}" "${TMP_DIR}/${ASSET}.sha256"; then
+                  return 0
+                fi
+
+                echo "Download failed from ${DOWNLOAD_URL}, trying next source..." >&2
+              done
+
+              echo "Failed to download release package from all sources." >&2
+              return 1
+            }
+
+            download_release_files
 
             cd "${TMP_DIR}"
             sha256sum -c "${ASSET}.sha256"

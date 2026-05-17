@@ -6,6 +6,7 @@ sidebar: false
 prev: true
 next: false
 outline: false
+returnToTop: false
 ---
 
 # 金街舞萌公告板

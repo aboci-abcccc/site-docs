@@ -11,9 +11,9 @@ export default defineConfig({
   lastUpdated: true,
   markdown: {
     config(md) {
-      const defaultHeadingClose =
-        md.renderer.rules.heading_close ||
-        ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options));
+      const defaultHeadingClose = md.renderer.rules.heading_close ||
+        ((tokens, idx, options, env, self) =>
+          self.renderToken(tokens, idx, options));
 
       md.renderer.rules.heading_close = (tokens, idx, options, env, self) => {
         const result = defaultHeadingClose(tokens, idx, options, env, self);
@@ -64,12 +64,13 @@ export default defineConfig({
           { text: "自介条", link: "/intro" },
           { text: "高中笔记", link: "/notes" },
           { text: "maimai 常用资源汇总", link: "/maimai" },
+          { text: "maimai 维护手册", link: "/maimai-maintenance" },
           { text: "塘沽金街舞萌公告板", link: "/get-gloves" },
         ],
       },
     ],
     outline: {
-      label: "本页目录",
+      label: "索引",
     },
     docFooter: {
       prev: "上一页",
@@ -82,7 +83,7 @@ export default defineConfig({
     sidebarMenuLabel: "菜单",
     returnToTopLabel: "返回顶部",
     lastUpdated: {
-      text: "上次更新时间",
+      text: "更新时间",
     },
 
     nav: [

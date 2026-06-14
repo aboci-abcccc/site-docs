@@ -15,6 +15,7 @@ sidebar: true
 <img src="./public/头像2.jpg" class="avatar2" />
 <img src="./public/头像3.jpg" class="avatar3" />
 <img src="./public/头像4.jpg" class="avatar4" />
+<img src="./public/头像5.jpg" class="avatar5" />
 </div>
 
 ### = abc / 啊波呲 / 糍粑

@@ -63,6 +63,10 @@ export default defineConfig({
         items: [
           { text: "自介条", link: "/intro" },
           { text: "高中笔记", link: "/notes" },
+          {
+            text: "舞萌机台排队通用管理办法",
+            link: "/queue-management-regulations",
+          },
           { text: "maimai 常用资源汇总", link: "/maimai" },
           { text: "maimai 维护手册", link: "/maimai-maintenance" },
           { text: "塘沽金街舞萌公告板", link: "/get-gloves" },

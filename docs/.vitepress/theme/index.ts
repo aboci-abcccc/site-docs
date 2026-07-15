@@ -7,6 +7,7 @@ import ArticleMetadata from './components/ArticleMetadata.vue'
 import PdfViewer from './components/PdfViewer.vue'
 import PdfStandaloneViewer from './components/PdfStandaloneViewer.vue'
 import PdfFullscreenLayout from './components/PdfFullscreenLayout.vue'
+import MaimaiBoardNav from './components/MaimaiBoardNav.vue'
 import './style.css'
 
 export default {
@@ -17,6 +18,7 @@ export default {
     app.component('PdfViewer', PdfViewer)
     app.component('PdfStandaloneViewer', PdfStandaloneViewer)
     app.component('pdf-fullscreen', PdfFullscreenLayout)
+    app.component('MaimaiBoardNav', MaimaiBoardNav)
   },
   Layout() {
     return h(DefaultTheme.Layout, null, {

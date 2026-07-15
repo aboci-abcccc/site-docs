@@ -69,7 +69,7 @@ export default defineConfig({
           },
           { text: "maimai 常用资源汇总", link: "/maimai" },
           { text: "maimai 维护手册", link: "/maimai-maintenance" },
-          { text: "塘沽金街舞萌公告板", link: "/get-gloves" },
+          { text: "塘沽金街舞萌公告板", link: "/maimai-board" },
         ],
       },
     ],
@@ -121,6 +121,11 @@ export default defineConfig({
     },
   },
   head: [
+    [
+      "script",
+      {},
+      `if (location.hostname === "maimai.abcccc.top" && (location.pathname === "/" || location.pathname === "/index.html")) location.replace("/maimai-board")`,
+    ],
     [
       "link",
       { rel: "preconnect", href: "https://fonts.googleapis.com" },

@@ -154,6 +154,7 @@ p {
 }
 
 .get-gloves-page .VPLocalNav,
+.maimai-queue-page .VPLocalNav,
 .maimai-counter-page .VPLocalNav,
 .maimai-board-page .VPLocalNav {
     display: none;
@@ -358,7 +359,7 @@ p {
 
 .maimai-page-links {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 9px;
     margin-top: 12px;
 }
@@ -396,6 +397,16 @@ p {
 }
 
 .maimai-counter-page .maimai-page-nav {
+    max-width: 1080px;
+    margin-right: auto;
+    margin-left: auto;
+}
+
+.maimai-queue-page .VPPage {
+    padding: 32px 20px 70px;
+}
+
+.maimai-queue-page .maimai-page-nav {
     max-width: 1080px;
     margin-right: auto;
     margin-left: auto;
@@ -557,6 +568,10 @@ p {
     }
 
     .maimai-counter-page .VPPage {
+        padding: 12px 8px 42px;
+    }
+
+    .maimai-queue-page .VPPage {
         padding: 12px 8px 42px;
     }
 

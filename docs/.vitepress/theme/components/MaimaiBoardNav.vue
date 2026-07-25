@@ -11,6 +11,7 @@ defineProps({
 })
 
 const links = [
+  { key: 'queue', label: '排队登记', href: '/queue-status', icon: '○' },
   { key: 'counter', label: '机厅人数统计', href: '/counter', icon: '◎' },
   { key: 'items', label: '获取机厅物品', href: '/get-gloves', icon: '◈' },
   { key: 'rules', label: '相关规则', href: '/maimai-rules', icon: '◇' },

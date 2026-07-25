@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@lucide/vue':
+        specifier: ^1.25.0
+        version: 1.25.0(vue@3.5.33(typescript@5.9.3))
       '@theojs/lumen':
         specifier: ^6.4.6
         version: 6.4.6(vue@3.5.33(typescript@5.9.3))
@@ -441,6 +444,11 @@ packages:
 
   '@leafer/web-core@2.1.0':
     resolution: {integrity: sha512-DaVMQ1mAO2Gjnsr3JG7uYr5muC8TFaMrY32IHToLXhURwnHsDOScT5qe4BYgYTShrBa2XdXLlu09BDNyePAAoQ==}
+
+  '@lucide/vue@1.25.0':
+    resolution: {integrity: sha512-hkEetV+v48ScIn3uwqwWQ66sI8foeP2q6OMI09GzLFH4SfvBlfe3JHYlMBdBCqFC7WRlhFsndyDn/awRKRc2OQ==}
+    peerDependencies:
+      vue: '>=3.0.1'
 
   '@napi-rs/canvas-android-arm64@0.1.100':
     resolution: {integrity: sha512-hjhCKhntPv9+t4ckHymdx0phYNcVW+GKQR6Lzw2zE+pOVjOplSmtx9nNNknTjbEDLcuLZqA1y8ufKg1XfgftzQ==}
@@ -1628,6 +1636,10 @@ snapshots:
       '@leafer/image-web': 2.1.0
       '@leafer/interface': 2.1.0
       '@leafer/partner': 2.1.0
+
+  '@lucide/vue@1.25.0(vue@3.5.33(typescript@5.9.3))':
+    dependencies:
+      vue: 3.5.33(typescript@5.9.3)
 
   '@napi-rs/canvas-android-arm64@0.1.100':
     optional: true

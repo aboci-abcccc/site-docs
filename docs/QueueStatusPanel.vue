@@ -1,0 +1,1648 @@
+<script setup>
+import {
+  ChevronRight,
+  CircleCheck,
+  History,
+  MapPin,
+  RefreshCw,
+  TriangleAlert,
+  UserRoundCheck,
+  Users,
+  WifiOff,
+  X
+} from '@lucide/vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+
+const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL || 'https://abcccc.top/api/queue-status'
+const QUEUE_LOG_API_URL = import.meta.env.VITE_QUEUE_LOG_API_URL ||
+  QUEUE_API_URL.replace(/queue-status(?:\?.*)?$/, 'queue-logs')
+const REFRESH_INTERVAL = 10000
+const SELF_STORAGE_KEY = 'maimai-q:marked-registration:v1'
+const MAX_SELF_REGISTRATION_HISTORY = 24
+
+const machineDefinitions = [
+  { id: 'A', name: '左侧 · 机台 A' },
+  { id: 'B', name: '右侧 · 机台 B' }
+]
+const logSourceDefinitions = [
+  { value: 'ALL', label: '全部来源' },
+  { value: 'ON_SITE_TERMINAL', label: '现场终端' },
+  { value: 'QQ_BOT', label: 'QQ Bot' },
+  { value: 'SYSTEM_AUTOMATIC', label: '系统自动' },
+  { value: 'WEBSITE_REMOTE', label: '网站远程' }
+]
+
+const machines = ref(machineDefinitions.map(createEmptyMachine))
+const registrationOpen = ref(null)
+const businessHours = ref({
+  enabled: false,
+  outside: false,
+  closingSoon: false,
+  closingGrace: false,
+  closesAt: null,
+  registrationClosesAt: null
+})
+const terminal = ref(null)
+const capabilities = ref({})
+const capturedAt = ref(null)
+const queueId = ref(null)
+const hasSnapshot = ref(false)
+const loading = ref(true)
+const refreshing = ref(false)
+const loadError = ref(false)
+const activeView = ref('queue')
+const selectedDetail = ref(null)
+const pendingSelfRegistration = ref(null)
+const markedSelf = ref(null)
+const currentLogs = ref([])
+const currentLogsQueueId = ref(null)
+const currentLogsNextCursor = ref(null)
+const logsLoading = ref(false)
+const logsLoadingMore = ref(false)
+const logsError = ref(false)
+const logFilter = ref('ALL')
+const logSourceFilter = ref('ALL')
+const markedSelfLogs = ref([])
+const selfStorageAvailable = ref(true)
+const currentTime = ref(Date.now())
+let refreshTimer
+let clockTimer
+
+const totalRegistrationCount = computed(() => (
+  machines.value.reduce((total, machine) => total + machine.registrationCount, 0)
+))
+
+const terminalOnline = computed(() => (
+  hasSnapshot.value && terminal.value?.online !== false
+))
+
+const availability = computed(() => {
+  if (!hasSnapshot.value) {
+    return { label: loading.value ? '正在连接排队终端' : '排队终端暂未接入', tone: 'offline' }
+  }
+  if (loadError.value) return { label: '连接暂时中断', tone: 'closed' }
+  if (!terminalOnline.value) return { label: '排队终端离线', tone: 'offline' }
+  if (businessHours.value.enabled && businessHours.value.outside) {
+    return { label: '不在营业时间', tone: 'outside' }
+  }
+  if (registrationOpen.value === false) return { label: '当前采用现场自然排队', tone: 'closed' }
+  return null
+})
+
+const outsideBusinessHours = computed(() => (
+  businessHours.value.enabled && businessHours.value.outside
+))
+
+const businessHoursClosingGrace = computed(() => (
+  businessHours.value.enabled &&
+  businessHours.value.outside &&
+  businessHours.value.closingGrace
+))
+
+const businessHoursClosingSoon = computed(() => (
+  businessHours.value.enabled &&
+  !businessHours.value.outside &&
+  businessHours.value.closingSoon
+))
+
+const capturedTimeText = computed(() => {
+  const date = parseDate(capturedAt.value)
+  if (!date) return '--:--'
+  return date.toLocaleTimeString('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  })
+})
+
+const registrationLocations = computed(() => {
+  const locations = []
+  machines.value.forEach((machine) => {
+    machine.playing.forEach((registration) => {
+      locations.push({
+        registration,
+        machine,
+        kind: 'PLAYING',
+        label: `游玩位置 ${machine.id}`,
+        estimate: 0,
+        registrations: machine.playing
+      })
+    })
+    machine.waitingPositions.forEach((position, index) => {
+      position.registrations.forEach((registration) => {
+        locations.push({
+          registration,
+          machine,
+          kind: 'WAITING',
+          label: `位置 ${machine.id}${index + 1}`,
+          estimate: position.estimatedWaitMinutes,
+          registrations: position.registrations
+        })
+      })
+    })
+  })
+  return locations
+})
+
+const markedSelfResolution = computed(() => {
+  const identity = markedSelf.value
+  if (!identity) return { location: null, ambiguous: false }
+
+  const exactLocation = registrationLocations.value.find((location) => (
+    location.registration.registrationId === identity.registrationId
+  ))
+  if (exactLocation) return { location: exactLocation, ambiguous: false }
+
+  const qqNumber = normalizeQqNumber(identity.qqNumber)
+  if (qqNumber) {
+    const qqMatches = registrationLocations.value.filter((location) => (
+      location.registration.qqNumber === qqNumber
+    ))
+    if (qqMatches.length === 1) return { location: qqMatches[0], ambiguous: false }
+    if (qqMatches.length > 1) return { location: null, ambiguous: true }
+  }
+
+  const nickname = normalizePlayerNickname(identity.displayId)
+  if (!nickname) return { location: null, ambiguous: false }
+  const nicknameMatches = registrationLocations.value.filter((location) => (
+    normalizePlayerNickname(location.registration.displayId) === nickname
+  ))
+  if (nicknameMatches.length === 1) {
+    return { location: nicknameMatches[0], ambiguous: false }
+  }
+  return { location: null, ambiguous: nicknameMatches.length > 1 }
+})
+
+const markedSelfLocation = computed(() => markedSelfResolution.value.location)
+const markedSelfAmbiguous = computed(() => markedSelfResolution.value.ambiguous)
+
+const markedSelfLastEvent = computed(() => {
+  const registrationIds = knownSelfRegistrationIds()
+  if (!registrationIds.length) return null
+  return markedSelfLogs.value.find((event) => (
+    event.registrationIds.some((registrationId) => registrationIds.includes(registrationId))
+  )) || null
+})
+
+const markedSelfPartnerText = computed(() => {
+  const location = markedSelfLocation.value
+  if (!location) return null
+  const partners = location.registrations.filter((registration) => (
+    registration.registrationId !== location.registration.registrationId
+  ))
+  if (!partners.length) return '当前为单人安排'
+  return `将与${partners.map((partner) => `“${partner.displayId}”`).join('、')}共同游玩`
+})
+
+const filteredLogs = computed(() => {
+  const machineFiltered = logFilter.value === 'ALL'
+    ? currentLogs.value
+    : logFilter.value === 'SYSTEM'
+      ? currentLogs.value.filter((event) => !event.machineId)
+      : currentLogs.value.filter((event) => event.machineId === logFilter.value)
+  return logSourceFilter.value === 'ALL'
+    ? machineFiltered
+    : machineFiltered.filter((event) => event.operationSource === logSourceFilter.value)
+})
+
+function createEmptyMachine(definition) {
+  return {
+    ...definition,
+    synced: false,
+    operational: true,
+    stopReason: null,
+    stopReasonDetail: null,
+    playingStartedAt: null,
+    playing: [],
+    waitingPositions: [],
+    registrationCount: 0
+  }
+}
+
+function parseDate(value) {
+  if (value === null || value === undefined || value === '') return null
+  const normalizedValue = typeof value === 'number' && value < 1_000_000_000_000
+    ? value * 1000
+    : value
+  const date = new Date(normalizedValue)
+  return Number.isFinite(date.getTime()) ? date : null
+}
+
+function toNonNegativeInteger(value) {
+  if (value === null || value === undefined || value === '') return null
+  const number = Number(value)
+  return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : null
+}
+
+function normalizeQqNumber(value) {
+  const qqNumber = typeof value === 'string' ? value.trim() : ''
+  return /^\d{5,12}$/.test(qqNumber) ? qqNumber : null
+}
+
+function normalizeRegistration(source, index) {
+  if (typeof source === 'string' || typeof source === 'number') {
+    return {
+      displayId: String(source),
+      registrationId: null,
+      preference: 'SOLO',
+      deferredOnce: false,
+      temporarilyAway: false,
+      temporaryAwaySkippedTurns: 0,
+      fixedPair: false,
+      fixedPairId: null,
+      noShowCount: 0,
+      lastNoShowActionWasDefer: false,
+      registrationType: 'TEMPORARY',
+      qqNumber: null
+    }
+  }
+
+  const displayId = source?.display_id ?? source?.displayId
+  return {
+    displayId: String(displayId || `登记 ${index + 1}`),
+    registrationId: source?.registration_id ?? source?.registrationId ?? null,
+    preference: String(source?.preference || 'SOLO').toUpperCase(),
+    deferredOnce: source?.deferred_once === true || source?.deferredOnce === true,
+    temporarilyAway: source?.temporarily_away === true || source?.temporarilyAway === true,
+    temporaryAwaySkippedTurns: toNonNegativeInteger(
+      source?.temporary_away_skipped_turns ?? source?.temporaryAwaySkippedTurns
+    ) ?? 0,
+    fixedPair: source?.fixed_pair === true || source?.fixedPair === true,
+    fixedPairId: source?.fixed_pair_id ?? source?.fixedPairId ?? null,
+    noShowCount: toNonNegativeInteger(source?.no_show_count ?? source?.noShowCount) ?? 0,
+    lastNoShowActionWasDefer: source?.last_no_show_action_was_defer === true ||
+      source?.lastNoShowActionWasDefer === true,
+    registrationType: String(
+      source?.registration_type || source?.registrationType || 'TEMPORARY'
+    ).toUpperCase(),
+    qqNumber: normalizeQqNumber(source?.qq_number ?? source?.qqNumber),
+    createdAt: source?.created_at ?? source?.createdAt ?? null,
+    lastPlayedAt: source?.last_played_at ?? source?.lastPlayedAt ?? null
+  }
+}
+
+function normalizePosition(source, index) {
+  const registrationsSource = Array.isArray(source) ? source : source?.registrations
+  const registrations = Array.isArray(registrationsSource)
+    ? registrationsSource.map(normalizeRegistration)
+    : []
+  const fixedPair = source?.fixed_pair === true || source?.fixedPair === true ||
+    (registrations.length === 2 && registrations.every((registration) => registration.fixedPair))
+
+  return {
+    registrations: fixedPair
+      ? registrations.map((registration) => ({ ...registration, fixedPair: true }))
+      : registrations,
+    fixedPair,
+    estimatedWaitMinutes: toNonNegativeInteger(
+      source?.estimated_wait_minutes ?? source?.estimatedWaitMinutes
+    ),
+    positionId: source?.position_id ?? source?.positionId ?? null,
+    index
+  }
+}
+
+function normalizeMachine(definition, source) {
+  if (!source || typeof source !== 'object') return createEmptyMachine(definition)
+  const playingSource = Array.isArray(source.playing)
+    ? source.playing
+    : source.playing?.registrations
+  const playing = Array.isArray(playingSource) ? playingSource.map(normalizeRegistration) : []
+  const waitingSource = source.waiting_positions ?? source.waitingPositions
+  const waitingPositions = Array.isArray(waitingSource)
+    ? waitingSource.map(normalizePosition)
+    : []
+
+  return {
+    ...definition,
+    name: source.name || definition.name,
+    synced: true,
+    operational: source.operational !== false,
+    stopReason: source.stop_reason ?? source.stopReason ?? null,
+    stopReasonDetail: source.stop_reason_detail ?? source.stopReasonDetail ?? null,
+    playingStartedAt: source.playing_started_at ?? source.playingStartedAt ?? null,
+    playing,
+    waitingPositions,
+    registrationCount: playing.length + waitingPositions.reduce(
+      (total, position) => total + position.registrations.length,
+      0
+    )
+  }
+}
+
+function machineSource(sources, definition) {
+  if (Array.isArray(sources)) {
+    return sources.find((source) => (
+      String(source?.id ?? source?.machine_id).toUpperCase() === definition.id
+    ))
+  }
+  return sources?.[definition.id] ?? sources?.[definition.id.toLowerCase()]
+}
+
+function normalizeBusinessHours(source) {
+  if (!source || typeof source !== 'object') {
+    return {
+      enabled: false,
+      outside: false,
+      closingSoon: false,
+      closingGrace: false,
+      closesAt: null,
+      registrationClosesAt: null
+    }
+  }
+  const enabled = source.enabled === true
+  return {
+    enabled,
+    outside: enabled && (source.outside === true || source.outsideBusinessHours === true),
+    closingSoon: enabled && (source.closing_soon === true || source.closingSoon === true),
+    closingGrace: enabled && (source.closing_grace === true || source.closingGrace === true),
+    closesAt: source.closes_at ?? source.closesAt ?? null,
+    registrationClosesAt: source.registration_closes_at ?? source.registrationClosesAt ?? null
+  }
+}
+
+function applyServerData(data) {
+  const sources = data?.machines
+  if (!sources || typeof sources !== 'object') throw new Error('Invalid queue snapshot')
+
+  const previousQueueId = queueId.value
+  const nextQueueId = data?.queue_id ?? data?.queueId ?? null
+  if (previousQueueId && nextQueueId && previousQueueId !== nextQueueId) {
+    selectedDetail.value = null
+    currentLogs.value = []
+    currentLogsQueueId.value = null
+    currentLogsNextCursor.value = null
+  }
+  machines.value = machineDefinitions.map((definition) => (
+    normalizeMachine(definition, machineSource(sources, definition))
+  ))
+  registrationOpen.value = data?.registration_open ?? data?.registrationOpen ?? true
+  businessHours.value = normalizeBusinessHours(data?.business_hours ?? data?.businessHours)
+  terminal.value = data?.terminal ?? { online: true }
+  capabilities.value = data?.capabilities || {}
+  queueId.value = nextQueueId
+  capturedAt.value = data?.received_at ?? data?.receivedAt ??
+    data?.captured_at ?? data?.capturedAt ?? new Date().toISOString()
+  hasSnapshot.value = true
+  loadError.value = false
+  reconcileSelectedDetail()
+  reconcileMarkedSelfIdentity()
+}
+
+async function loadQueue(silent = false) {
+  if (refreshing.value) return
+  refreshing.value = true
+  if (!silent && !hasSnapshot.value) loading.value = true
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), 5000)
+
+  try {
+    const response = await fetch(QUEUE_API_URL, {
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    applyServerData(await response.json())
+    await refreshMarkedSelfLogs()
+    if (activeView.value === 'logs') await loadCurrentLogs(true)
+  } catch {
+    loadError.value = true
+  } finally {
+    window.clearTimeout(timeout)
+    loading.value = false
+    refreshing.value = false
+  }
+}
+
+function normalizeLogEvent(source) {
+  return {
+    cursor: toNonNegativeInteger(source?.cursor),
+    eventId: source?.event_id ?? source?.eventId ?? null,
+    occurredAt: source?.occurred_at ?? source?.occurredAt ?? null,
+    machineId: source?.machine_id ?? source?.machineId ?? null,
+    type: String(source?.type || 'OTHER').toUpperCase(),
+    title: String(source?.title || '队列已更新'),
+    detail: String(source?.detail || ''),
+    operationSource: String(
+      source?.operation_source ?? source?.operationSource ?? 'ON_SITE_TERMINAL'
+    ).toUpperCase(),
+    registrationIds: Array.isArray(source?.registration_ids)
+      ? source.registration_ids.map(String)
+      : []
+  }
+}
+
+async function fetchLogs(targetQueueId, before = null, limit = 50) {
+  const url = new URL(QUEUE_LOG_API_URL, window.location.href)
+  if (targetQueueId) url.searchParams.set('queue_id', targetQueueId)
+  url.searchParams.set('limit', String(limit))
+  if (before) url.searchParams.set('before', String(before))
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), 5000)
+  try {
+    const response = await fetch(url, {
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const data = await response.json()
+    return {
+      logs: Array.isArray(data?.logs) ? data.logs.map(normalizeLogEvent) : [],
+      nextCursor: toNonNegativeInteger(data?.next_cursor),
+      queueId: data?.queue_id ?? targetQueueId
+    }
+  } finally {
+    window.clearTimeout(timeout)
+  }
+}
+
+async function loadCurrentLogs(reset = true) {
+  if (!queueId.value || logsLoading.value || logsLoadingMore.value) return
+  const requestedQueueId = queueId.value
+  if (reset) logsLoading.value = true
+  else logsLoadingMore.value = true
+  logsError.value = false
+  try {
+    const result = await fetchLogs(
+      requestedQueueId,
+      reset ? null : currentLogsNextCursor.value
+    )
+    if (requestedQueueId !== queueId.value) return
+    currentLogs.value = reset
+      ? result.logs
+      : [...currentLogs.value, ...result.logs.filter((event) => (
+        !currentLogs.value.some((existing) => existing.eventId === event.eventId)
+      ))]
+    currentLogsQueueId.value = requestedQueueId
+    currentLogsNextCursor.value = result.nextCursor
+  } catch {
+    logsError.value = true
+  } finally {
+    logsLoading.value = false
+    logsLoadingMore.value = false
+  }
+}
+
+async function refreshMarkedSelfLogs() {
+  const identity = markedSelf.value
+  if (!identity?.queueId) {
+    markedSelfLogs.value = []
+    return
+  }
+  try {
+    const result = await fetchLogs(identity.queueId, null, 100)
+    if (markedSelf.value?.queueId === identity.queueId) {
+      markedSelfLogs.value = result.logs
+      if (identity.queueId === currentLogsQueueId.value) {
+        currentLogs.value = result.logs
+        currentLogsNextCursor.value = result.nextCursor
+      }
+    }
+  } catch {
+    markedSelfLogs.value = []
+  }
+}
+
+function switchView(view) {
+  activeView.value = view
+  if (view === 'logs') loadCurrentLogs(true)
+}
+
+function restoreMarkedSelf() {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(SELF_STORAGE_KEY) || 'null')
+    if (
+      parsed && typeof parsed.queueId === 'string' &&
+      typeof parsed.registrationId === 'string' && typeof parsed.displayId === 'string'
+    ) {
+      persistMarkedSelf(parsed)
+    }
+  } catch {
+    selfStorageAvailable.value = false
+    try {
+      window.localStorage.removeItem(SELF_STORAGE_KEY)
+    } catch {
+      // Some browsers disable local storage entirely. The mark can still work for this page view.
+    }
+  }
+}
+
+function requestMarkAsSelf(registration) {
+  if (!registration.registrationId || !queueId.value) return
+  const nextIdentity = {
+    queueId: queueId.value,
+    registrationId: registration.registrationId,
+    registrationIds: [
+      registration.registrationId,
+      ...knownSelfRegistrationIds()
+    ],
+    displayId: registration.displayId,
+    qqNumber: normalizeQqNumber(registration.qqNumber),
+    markedAt: Date.now()
+  }
+  if (
+    markedSelf.value &&
+    !isSameMarkedPlayer(markedSelf.value, nextIdentity)
+  ) {
+    pendingSelfRegistration.value = nextIdentity
+    selectedDetail.value = null
+    return
+  }
+  saveMarkedSelf(nextIdentity)
+  selectedDetail.value = null
+}
+
+function confirmReplaceMarkedSelf() {
+  if (pendingSelfRegistration.value) saveMarkedSelf(pendingSelfRegistration.value)
+  pendingSelfRegistration.value = null
+}
+
+function saveMarkedSelf(identity) {
+  persistMarkedSelf(identity)
+  refreshMarkedSelfLogs()
+}
+
+function persistMarkedSelf(identity) {
+  const normalizedIdentity = normalizeMarkedSelfIdentity(identity)
+  markedSelf.value = normalizedIdentity
+  try {
+    window.localStorage.setItem(SELF_STORAGE_KEY, JSON.stringify(normalizedIdentity))
+    selfStorageAvailable.value = true
+  } catch {
+    selfStorageAvailable.value = false
+  }
+}
+
+function normalizeMarkedSelfIdentity(identity) {
+  const registrationIds = [...new Set([
+    identity?.registrationId,
+    ...(Array.isArray(identity?.registrationIds) ? identity.registrationIds : [])
+  ].filter((registrationId) => typeof registrationId === 'string' && registrationId))]
+    .slice(0, MAX_SELF_REGISTRATION_HISTORY)
+  return {
+    ...identity,
+    qqNumber: normalizeQqNumber(identity?.qqNumber),
+    registrationIds
+  }
+}
+
+function isSameMarkedPlayer(first, second) {
+  const firstQqNumber = normalizeQqNumber(first?.qqNumber)
+  const secondQqNumber = normalizeQqNumber(second?.qqNumber)
+  if (firstQqNumber && secondQqNumber) return firstQqNumber === secondQqNumber
+  return normalizePlayerNickname(first?.displayId) === normalizePlayerNickname(second?.displayId)
+}
+
+function knownSelfRegistrationIds(identity = markedSelf.value) {
+  if (!identity) return []
+  return normalizeMarkedSelfIdentity(identity).registrationIds
+}
+
+function normalizePlayerNickname(value) {
+  return String(value || '').trim().normalize('NFC').toLocaleLowerCase('zh-CN')
+}
+
+function reconcileSelectedDetail() {
+  const detail = selectedDetail.value
+  if (!detail) return
+
+  if (detail.kind === 'registration') {
+    const location = registrationLocations.value.find(({ registration }) => (
+      registration.registrationId && registration.registrationId === detail.registration.registrationId
+    ))
+    if (!location) {
+      selectedDetail.value = null
+      return
+    }
+    openRegistration(
+      location.machine,
+      location.registration,
+      location.label,
+      location.kind === 'PLAYING' ? null : location.estimate,
+      location.registrations
+    )
+    return
+  }
+
+  const machine = machines.value.find(({ id }) => id === detail.machine.id)
+  const position = detail.isPlaying
+    ? null
+    : machine?.waitingPositions.find(({ positionId }) => positionId === detail.positionId)
+  if (!machine || (detail.isPlaying ? machine.playing.length === 0 : !position)) {
+    selectedDetail.value = null
+    return
+  }
+  openPosition(machine, position)
+}
+
+function reconcileMarkedSelfIdentity() {
+  const identity = markedSelf.value
+  const location = markedSelfResolution.value.location
+  if (!identity || !location?.registration.registrationId || !queueId.value) return
+
+  const registration = location.registration
+  if (
+    identity.queueId === queueId.value &&
+    identity.registrationId === registration.registrationId &&
+    identity.displayId === registration.displayId &&
+    normalizeQqNumber(identity.qqNumber) === registration.qqNumber
+  ) return
+
+  persistMarkedSelf({
+    ...identity,
+    queueId: queueId.value,
+    registrationId: registration.registrationId,
+    registrationIds: [registration.registrationId, ...knownSelfRegistrationIds(identity)],
+    displayId: registration.displayId,
+    qqNumber: registration.qqNumber,
+    lastMatchedAt: Date.now()
+  })
+}
+
+function clearMarkedSelf() {
+  markedSelf.value = null
+  markedSelfLogs.value = []
+  pendingSelfRegistration.value = null
+  try {
+    window.localStorage.removeItem(SELF_STORAGE_KEY)
+  } catch {
+    selfStorageAvailable.value = false
+  }
+}
+
+function isMarkedRegistration(registration) {
+  return Boolean(markedSelfLocation.value?.registration.registrationId &&
+    markedSelfLocation.value.registration.registrationId === registration.registrationId)
+}
+
+function stopReasonLabel(reason, detail = null) {
+  const normalizedReason = String(reason || '').toUpperCase()
+  const labels = {
+    NOT_POWERED_ON: '机台未开机',
+    NETWORK_DISCONNECTED: '机台断网',
+    MAINTENANCE: '机台维护',
+    OTHER: '其他原因'
+  }
+  const label = labels[normalizedReason] || '原因未记录'
+  const normalizedDetail = String(detail || '').trim().slice(0, 40)
+  return normalizedReason === 'OTHER' && normalizedDetail
+    ? `${label}（${normalizedDetail}）`
+    : label
+}
+
+function machineSummary(machine) {
+  if (!machine.synced) return '尚未同步现场状态'
+  const queueSummary = `${machine.waitingPositions.length} 个等待位置 · ${machine.registrationCount} 个登记`
+  if (!machine.operational) return `${queueSummary} · 已停止使用`
+  return machine.registrationCount > 0 ? queueSummary : '当前空闲'
+}
+
+function playingLabel(machine) {
+  const base = `游玩位置 ${machine.id}`
+  if (!machine.playing.length) return base
+  if (!machine.operational) return `${base} · 已暂停`
+  const startedAt = parseDate(machine.playingStartedAt)
+  if (!startedAt) return base
+  const minutes = Math.max(0, Math.floor((currentTime.value - startedAt.getTime()) / 60000))
+  return minutes === 0 ? `${base} · 刚刚` : `${base} · 已游玩 ${minutes} 分钟`
+}
+
+function playingOvertime(machine) {
+  if (!machine.operational) return false
+  const startedAt = parseDate(machine.playingStartedAt)
+  return Boolean(startedAt && currentTime.value - startedAt.getTime() > 20 * 60 * 1000)
+}
+
+function positionLabel(machine, position, index) {
+  return `位置 ${machine.id}${index + 1}${position.fixedPair ? ' · 固定组合' : ''}`
+}
+
+function absenceLabel(registration) {
+  if (registration.temporarilyAway) {
+    return registration.temporaryAwaySkippedTurns > 0
+      ? `暂时离开 · 已轮空 ${registration.temporaryAwaySkippedTurns} 次`
+      : '暂时离开'
+  }
+  if (registration.deferredOnce) return '暂缓一轮'
+  return null
+}
+
+function registrationLabel(registration) {
+  return absenceLabel(registration) ||
+    (registration.noShowCount > 0 ? `未到场 ${registration.noShowCount} 次` : null) ||
+    (registration.fixedPair ? '固定组合' : null) ||
+    (registration.preference === 'SOLO' ? '单人游玩' : '允许他人加入')
+}
+
+function registrationTone(registration) {
+  if (registration.temporarilyAway || registration.deferredOnce) return 'absence'
+  if (registration.noShowCount > 0) return 'warning'
+  return 'normal'
+}
+
+function positionEstimateText(minutes, registrations = [], machine = null) {
+  if (machine?.operational === false) return '机台恢复使用后重新估算'
+  if (registrations.some((registration) => registration.temporarilyAway)) {
+    return '暂时离开，无法估算'
+  }
+  if (minutes === null || minutes === undefined) return '暂时无法估算'
+  if (minutes <= 0) return '预计现在可以游玩'
+  return `约 ${minutes} 分钟后可以游玩`
+}
+
+function registrationTypeLabel(registration) {
+  return registration.registrationType === 'PLAYER_PROFILE' ? '玩家资料登记' : '临时登记'
+}
+
+function preferenceLabel(registration) {
+  if (registration.fixedPair) return '与朋友共同游玩'
+  return registration.preference === 'SOLO' ? '单人游玩' : '允许他人加入'
+}
+
+function noShowResultLabel(registration) {
+  if (!registration.noShowCount) return null
+  return registration.lastNoShowActionWasDefer
+    ? `未到场 ${registration.noShowCount} 次 · 上次处理：暂缓一轮`
+    : `未到场 ${registration.noShowCount} 次 · 上次处理：移至队尾`
+}
+
+function fullTimeText(value, fallback = '尚无记录') {
+  const date = parseDate(value)
+  if (!date) return fallback
+  return date.toLocaleString('zh-CN', {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  })
+}
+
+function openPosition(machine, position = null) {
+  const isPlaying = position === null
+  const registrations = isPlaying ? machine.playing : position.registrations
+  if (!registrations.length) return
+  selectedDetail.value = {
+    kind: 'position',
+    title: isPlaying ? `游玩位置 ${machine.id}` : positionLabel(machine, position, position.index),
+    machine,
+    registrations,
+    isPlaying,
+    estimate: isPlaying ? null : position.estimatedWaitMinutes,
+    playingText: isPlaying ? playingLabel(machine) : null,
+    positionId: isPlaying ? null : position.positionId
+  }
+}
+
+function openRegistration(
+  machine,
+  registration,
+  locationLabel,
+  estimatedWaitMinutes = null,
+  locationRegistrations = []
+) {
+  selectedDetail.value = {
+    kind: 'registration',
+    title: registration.displayId,
+    machine,
+    locationLabel,
+    estimatedWaitMinutes,
+    locationRegistrations,
+    registration
+  }
+}
+
+function openRegistrationFromPosition(registration) {
+  const detail = selectedDetail.value
+  if (!detail || detail.kind !== 'position') return
+  openRegistration(
+    detail.machine,
+    registration,
+    detail.title.replace(' · 固定组合', ''),
+    detail.isPlaying ? null : detail.estimate,
+    detail.registrations
+  )
+}
+
+function closeDetail() {
+  selectedDetail.value = null
+}
+
+function markedSelfStatusTitle() {
+  const location = markedSelfLocation.value
+  if (!location) {
+    if (markedSelfAmbiguous.value) return '发现多份同名登记'
+    if (markedSelf.value?.queueId !== queueId.value) return '当前队列中还没有你的登记'
+    if (markedSelfLastEvent.value) return eventOutcomeTitle(markedSelfLastEvent.value)
+    return '你的登记目前不在队列中'
+  }
+  const registration = location.registration
+  if (!location.machine.operational) return `${location.machine.name} 已停止使用`
+  if (registration.temporarilyAway) return '你当前处于暂时离开状态'
+  if (registration.deferredOnce) return '你已暂缓一轮'
+  if (location.kind === 'PLAYING') return '现在轮到你游玩'
+  return positionEstimateText(location.estimate, location.registrations, location.machine)
+}
+
+function markedSelfStatusDetail() {
+  const location = markedSelfLocation.value
+  if (!location) {
+    if (markedSelfAmbiguous.value) {
+      return `当前有多份昵称为“${markedSelf.value?.displayId}”的登记。请点开属于你的登记，并再次选择“标记为自己”。`
+    }
+    if (markedSelf.value?.queueId !== queueId.value) {
+      return '标记会继续保留；使用相同昵称加入当前队列后，位置和预计时间会自动恢复更新。'
+    }
+    const event = markedSelfLastEvent.value
+    if (event) {
+      return `${event.detail} 标记会继续保留，使用相同昵称重新加入后将自动恢复更新。`
+    }
+    return '标记会继续保留；使用相同昵称再次加入排队后，位置和预计时间会自动恢复更新。'
+  }
+  const registration = location.registration
+  if (!location.machine.operational) {
+    return `停止原因：${stopReasonLabel(
+      location.machine.stopReason,
+      location.machine.stopReasonDetail
+    )}。登记顺序仍然保留，机台恢复正常使用后会重新开始本轮计时。`
+  }
+  if (registration.temporarilyAway) {
+    const skipped = registration.temporaryAwaySkippedTurns
+    return skipped > 0
+      ? `排队时会暂时忽略这份登记，目前已轮空 ${skipped} 次；第四次轮到时仍未解除，将退出排队。`
+      : '排队时会暂时忽略这份登记。需要在终端手动解除，才能再次被安排上机。'
+  }
+  if (registration.deferredOnce) return '本次上机机会会被跳过，轮到下一组时将自动解除。'
+  if (location.kind === 'PLAYING') return markedSelfPartnerText.value
+  return markedSelfPartnerText.value
+}
+
+function markedSelfTone() {
+  const location = markedSelfLocation.value
+  if (!location) {
+    if (markedSelfAmbiguous.value) return 'warning'
+    return markedSelfLastEvent.value?.type.startsWith('NO_SHOW') ||
+      markedSelfLastEvent.value?.type === 'TEMPORARY_AWAY_EXPIRED'
+      ? 'danger'
+      : 'muted'
+  }
+  if (location.registration.noShowCount > 0) return 'danger'
+  if (!location.machine.operational || location.registration.temporarilyAway ||
+    location.registration.deferredOnce) return 'warning'
+  return location.kind === 'PLAYING' ? 'playing' : 'normal'
+}
+
+function eventOutcomeTitle(event) {
+  const labels = {
+    NO_SHOW_DEFERRED: '你被标记为未到场，并已暂缓一轮',
+    NO_SHOW_MOVED_TO_TAIL: '你被标记为未到场，并已移至队尾',
+    NO_SHOW_REMOVED: '你被标记为未到场，登记已被移除',
+    TEMPORARY_AWAY_EXPIRED: '暂时离开已达到轮空上限，登记已退出排队',
+    REGISTRATION_REMOVED: '这份登记已离开队列',
+    REGISTRATION_CLOSED: '登记排队已经关闭',
+    QUEUE_RESET: '现场已经开始新的队列'
+  }
+  return labels[event.type] || event.title
+}
+
+function eventTypeLabel(type) {
+  const labels = {
+    REGISTRATION_ADDED: '新增登记',
+    REGISTRATION_REMOVED: '移除登记',
+    REGISTRATION_UPDATED: '登记变动',
+    QUEUE_REORDERED: '顺序调整',
+    PLAYING_CHANGED: '游玩位置',
+    NO_SHOW_DEFERRED: '未到场 · 暂缓一轮',
+    NO_SHOW_MOVED_TO_TAIL: '未到场 · 移至队尾',
+    NO_SHOW_REMOVED: '未到场 · 移除登记',
+    TEMPORARY_AWAY_EXPIRED: '暂离期满退出',
+    ABSENCE_CHANGED: '暂缓或暂离',
+    MACHINE_STOPPED: '机台停止使用',
+    MACHINE_RESTORED: '机台恢复使用',
+    REGISTRATION_OPENED: '开放登记',
+    REGISTRATION_CLOSED: '关闭登记',
+    QUEUE_RESTORED: '恢复队列',
+    QUEUE_RESET: '新队列',
+    OTHER: '队列变动'
+  }
+  return labels[type] || '队列变动'
+}
+
+function logMachineLabel(event) {
+  if (!event.machineId) return '系统'
+  return machines.value.find((machine) => machine.id === event.machineId)?.name ||
+    `机台 ${event.machineId}`
+}
+
+function operationSourceLabel(source) {
+  return {
+    ON_SITE_TERMINAL: '现场终端',
+    QQ_BOT: 'QQ Bot',
+    SYSTEM_AUTOMATIC: '系统自动',
+    WEBSITE_REMOTE: '网站远程'
+  }[source] || '现场终端'
+}
+
+function eventIsMarkedSelf(event) {
+  const registrationIds = knownSelfRegistrationIds()
+  return registrationIds.length > 0 && event.registrationIds.some((registrationId) => (
+    registrationIds.includes(registrationId)
+  ))
+}
+
+function handleKeydown(event) {
+  if (event.key !== 'Escape') return
+  if (pendingSelfRegistration.value) pendingSelfRegistration.value = null
+  else closeDetail()
+}
+
+onMounted(async () => {
+  restoreMarkedSelf()
+  await loadQueue()
+  refreshTimer = window.setInterval(() => loadQueue(true), REFRESH_INTERVAL)
+  clockTimer = window.setInterval(() => { currentTime.value = Date.now() }, 30000)
+  window.addEventListener('keydown', handleKeydown)
+  await nextTick()
+})
+
+onBeforeUnmount(() => {
+  if (refreshTimer) window.clearInterval(refreshTimer)
+  if (clockTimer) window.clearInterval(clockTimer)
+  window.removeEventListener('keydown', handleKeydown)
+})
+</script>
+
+<template>
+  <main class="queue-panel">
+    <header class="queue-header">
+      <div class="queue-heading">
+        <h1>排队登记</h1>
+        <p>
+          <span>两台机台的登记顺序彼此独立</span>
+          <template v-if="hasSnapshot">
+            <span class="queue-heading-separator" aria-hidden="true">·</span>
+            <strong>当前共 {{ totalRegistrationCount }} 个登记</strong>
+          </template>
+        </p>
+      </div>
+
+      <div class="queue-toolbar">
+        <div class="queue-view-tabs" aria-label="页面内容">
+          <button :class="{ active: activeView === 'queue' }" type="button" @click="switchView('queue')">
+            排队状态
+          </button>
+          <button :class="{ active: activeView === 'logs' }" type="button" @click="switchView('logs')">
+            <History :size="15" aria-hidden="true" />
+            日志
+          </button>
+        </div>
+        <div class="queue-system">
+          <time :datetime="capturedAt || undefined">{{ capturedTimeText }}</time>
+          <template v-if="availability">
+            <span class="queue-system-divider" aria-hidden="true"></span>
+            <span class="queue-availability" :class="`is-${availability.tone}`">
+              <span aria-hidden="true"></span>
+              {{ availability.label }}
+            </span>
+          </template>
+          <button
+            class="queue-refresh"
+            type="button"
+            :disabled="refreshing"
+            aria-label="刷新排队状态"
+            title="刷新排队状态"
+            @click="activeView === 'logs' ? loadCurrentLogs(true) : loadQueue()"
+          >
+            <RefreshCw :size="18" :class="{ spinning: refreshing || logsLoading }" aria-hidden="true" />
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <section v-if="markedSelf" class="queue-self" :class="`is-${markedSelfTone()}`" aria-live="polite">
+      <div class="queue-self-icon" aria-hidden="true">
+        <UserRoundCheck :size="22" />
+      </div>
+      <div class="queue-self-main">
+        <span class="queue-self-eyebrow">我的排队</span>
+        <h2>{{ markedSelf.displayId }}</h2>
+        <strong>{{ markedSelfStatusTitle() }}</strong>
+        <p>{{ markedSelfStatusDetail() }}</p>
+        <div v-if="markedSelfLocation" class="queue-self-facts">
+          <span><MapPin :size="13" aria-hidden="true" />{{ markedSelfLocation.label }}</span>
+          <span v-if="markedSelfLocation.registration.noShowCount > 0">
+            <TriangleAlert :size="13" aria-hidden="true" />
+            {{ noShowResultLabel(markedSelfLocation.registration) }}
+          </span>
+          <span v-if="markedSelfLocation.registrations.length > 1">
+            <Users :size="13" aria-hidden="true" />共同游玩
+          </span>
+          <span v-if="!selfStorageAvailable" class="is-warning">
+            仅在本次浏览期间保留
+          </span>
+        </div>
+      </div>
+      <button class="queue-self-clear" type="button" @click="clearMarkedSelf">取消标记</button>
+    </section>
+
+    <section v-if="!hasSnapshot" class="queue-unavailable" aria-live="polite">
+      <span class="queue-unavailable-icon" aria-hidden="true"><WifiOff :size="22" /></span>
+      <div>
+        <h2>{{ loading ? '正在读取现场队列' : '排队终端暂未接入' }}</h2>
+        <p>{{ loading ? '正在等待终端返回最新登记状态。' : '终端完成联网同步后，这里会显示两台机台的实时登记顺序。' }}</p>
+      </div>
+    </section>
+
+    <template v-else-if="activeView === 'queue'">
+      <section
+        v-if="outsideBusinessHours || registrationOpen === false"
+        class="queue-natural-notice"
+        :class="{ 'is-outside': outsideBusinessHours }"
+      >
+        <TriangleAlert v-if="outsideBusinessHours" :size="19" aria-hidden="true" />
+        <CircleCheck v-else :size="19" aria-hidden="true" />
+        <div>
+          <strong>{{ outsideBusinessHours ? '不在营业时间' : '当前没有使用登记排队' }}</strong>
+          <span v-if="outsideBusinessHours">
+            {{ businessHoursClosingGrace
+              ? '今日营业时间已结束，现场正在完成现有队列；收尾期间不再接收新的排队登记。'
+              : registrationOpen
+                ? '当前仍处于非营业时段；现场已手动开启登记排队，网页会继续显示这一提醒。'
+                : '登记排队已经关闭；如现场手动开启，仍可继续使用登记排队。' }}
+          </span>
+          <span v-else>请按照现场顺序自然排队，并留意其他玩家的安排。</span>
+        </div>
+      </section>
+
+      <div class="queue-machine-list" :aria-busy="loading">
+        <section v-for="machine in machines" :key="machine.id" class="queue-machine">
+          <header class="queue-machine-header">
+            <div>
+              <h2>{{ machine.name }}</h2>
+              <p>{{ machineSummary(machine) }}</p>
+            </div>
+            <span v-if="!machine.operational" class="queue-machine-state">已停止</span>
+          </header>
+
+          <div v-if="!machine.synced" class="queue-machine-message">
+            <p>尚未同步这台机台</p>
+            <span>请检查终端上传的数据是否包含机台 {{ machine.id }}。</span>
+          </div>
+
+          <template v-else>
+            <div v-if="!machine.operational" class="queue-machine-message is-stopped">
+              <p>机台已停止使用</p>
+              <span>
+                停止原因：{{ stopReasonLabel(machine.stopReason, machine.stopReasonDetail) }}。{{ machine.registrationCount > 0
+                  ? `现有 ${machine.registrationCount} 份登记、游玩位置和等待顺序均已保留。`
+                  : '当前没有排队登记。' }}
+              </span>
+            </div>
+
+            <div class="queue-position-list">
+              <article
+                class="queue-position is-playing"
+                :class="{ 'is-actionable': machine.playing.length }"
+                :role="machine.playing.length ? 'button' : undefined"
+                :tabindex="machine.playing.length ? 0 : undefined"
+                @click="openPosition(machine)"
+                @keydown.enter.self.prevent="openPosition(machine)"
+                @keydown.space.self.prevent="openPosition(machine)"
+              >
+                <header>
+                  <span>{{ playingLabel(machine) }}</span>
+                  <ChevronRight v-if="machine.playing.length" :size="18" aria-hidden="true" />
+                </header>
+                <div
+                  v-if="!machine.playing.length && !businessHoursClosingGrace && !(businessHoursClosingSoon && machine.operational)"
+                  class="queue-position-empty"
+                >暂无登记</div>
+                <div v-else class="queue-registration-grid">
+                  <div v-if="businessHoursClosingGrace" class="queue-overtime is-closing">
+                     <strong>今日营业时间已结束</strong>
+                     <span>不再接收新登记。现有队列处理完毕后将关闭，最迟保留 20 分钟。</span>
+                   </div>
+                  <div v-else-if="businessHoursClosingSoon && machine.operational" class="queue-overtime is-closing-soon">
+                    <strong>将在 30 分钟内闭店</strong>
+                    <span>{{ playingOvertime(machine)
+                      ? '本轮已超过 20 分钟，请确认机台是否仍在正常游玩，并留意后续队列安排。'
+                      : '请留意后续队列安排。' }}</span>
+                  </div>
+                  <div v-else-if="playingOvertime(machine)" class="queue-overtime">
+                    <strong>本轮已超过 20 分钟</strong>
+                    <span>请确认机台是否仍在正常游玩。</span>
+                  </div>
+                  <button
+                    v-for="(registration, index) in machine.playing"
+                    :key="registration.registrationId || `playing-${machine.id}-${index}`"
+                    class="queue-registration"
+                    :class="[`is-${registrationTone(registration)}`, { 'is-self': isMarkedRegistration(registration) }]"
+                    type="button"
+                    @click.stop="openRegistration(machine, registration, `游玩位置 ${machine.id}`, null, machine.playing)"
+                  >
+                    <strong>{{ registration.displayId }}</strong>
+                    <span>{{ registrationLabel(registration) }}</span>
+                    <UserRoundCheck v-if="isMarkedRegistration(registration)" :size="14" aria-label="我的登记" />
+                    <ChevronRight v-else :size="15" aria-hidden="true" />
+                  </button>
+                </div>
+              </article>
+
+              <article
+                v-for="(position, index) in machine.waitingPositions"
+                :key="position.positionId || `${machine.id}-${index}`"
+                class="queue-position is-actionable"
+                role="button"
+                tabindex="0"
+                @click="openPosition(machine, position)"
+                @keydown.enter.self.prevent="openPosition(machine, position)"
+                @keydown.space.self.prevent="openPosition(machine, position)"
+              >
+                <header>
+                  <div class="queue-position-heading">
+                    <span>{{ positionLabel(machine, position, index) }}</span>
+                    <small>{{ positionEstimateText(position.estimatedWaitMinutes, position.registrations, machine) }}</small>
+                  </div>
+                  <ChevronRight :size="18" aria-hidden="true" />
+                </header>
+                <div class="queue-registration-grid">
+                  <button
+                    v-for="(registration, registrationIndex) in position.registrations"
+                    :key="registration.registrationId || `${machine.id}-${index}-${registrationIndex}`"
+                    class="queue-registration"
+                    :class="[`is-${registrationTone(registration)}`, { 'is-self': isMarkedRegistration(registration) }]"
+                    type="button"
+                    @click.stop="openRegistration(machine, registration, `位置 ${machine.id}${index + 1}`, position.estimatedWaitMinutes, position.registrations)"
+                  >
+                    <strong>{{ registration.displayId }}</strong>
+                    <span>{{ registrationLabel(registration) }}</span>
+                    <UserRoundCheck v-if="isMarkedRegistration(registration)" :size="14" aria-label="我的登记" />
+                    <ChevronRight v-else :size="15" aria-hidden="true" />
+                  </button>
+                </div>
+              </article>
+            </div>
+          </template>
+        </section>
+      </div>
+    </template>
+
+    <section v-else class="queue-logs" aria-live="polite">
+      <header class="queue-logs-header">
+        <div>
+          <h2>队列日志</h2>
+          <p>仅显示与公开排队状态有关的变动，不包含联系方式或玩家资料。</p>
+        </div>
+        <div class="queue-log-filter-groups">
+          <div class="queue-log-filters" aria-label="按范围筛选日志">
+            <button v-for="filter in ['ALL', 'A', 'B', 'SYSTEM']" :key="filter" type="button"
+              :class="{ active: logFilter === filter }" @click="logFilter = filter">
+              {{ filter === 'ALL' ? '全部' : filter === 'SYSTEM' ? '系统' : `机台 ${filter}` }}
+            </button>
+          </div>
+          <div class="queue-log-filters" aria-label="按操作来源筛选日志">
+            <button v-for="source in logSourceDefinitions" :key="source.value" type="button"
+              :class="{ active: logSourceFilter === source.value }"
+              @click="logSourceFilter = source.value">
+              {{ source.label }}
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div v-if="logsLoading" class="queue-logs-empty">
+        <RefreshCw class="spinning" :size="20" aria-hidden="true" />
+        <span>正在读取日志</span>
+      </div>
+      <div v-else-if="logsError" class="queue-logs-empty is-error">
+        <TriangleAlert :size="20" aria-hidden="true" />
+        <strong>暂时无法读取日志</strong>
+        <span>队列状态仍可正常查看。服务器更新日志接口后，这里会自动恢复。</span>
+        <button type="button" @click="loadCurrentLogs(true)">重新读取</button>
+      </div>
+      <div v-else-if="filteredLogs.length === 0" class="queue-logs-empty">
+        <History :size="20" aria-hidden="true" />
+        <strong>{{ currentLogs.length ? '这个筛选范围内没有日志' : '还没有可显示的队列日志' }}</strong>
+        <span>新版终端同步后发生的队列变动会显示在这里。</span>
+      </div>
+      <ol v-else class="queue-log-list">
+        <li v-for="event in filteredLogs" :key="event.eventId"
+          :class="{ 'is-self': eventIsMarkedSelf(event) }">
+          <div class="queue-log-time">
+            <time :datetime="event.occurredAt || undefined">{{ fullTimeText(event.occurredAt) }}</time>
+            <span>{{ logMachineLabel(event) }}</span>
+          </div>
+          <div class="queue-log-body">
+            <div class="queue-log-title">
+              <strong>{{ event.title }}</strong>
+              <span>{{ eventTypeLabel(event.type) }}</span>
+              <span>{{ operationSourceLabel(event.operationSource) }}</span>
+              <em v-if="eventIsMarkedSelf(event)">与我有关</em>
+            </div>
+            <p>{{ event.detail }}</p>
+          </div>
+        </li>
+      </ol>
+      <button v-if="currentLogsNextCursor && !logsError" class="queue-load-more" type="button"
+        :disabled="logsLoadingMore" @click="loadCurrentLogs(false)">
+        {{ logsLoadingMore ? '正在读取' : '查看更早的日志' }}
+      </button>
+    </section>
+
+    <Teleport to="body">
+      <Transition name="queue-dialog">
+        <div v-if="selectedDetail" class="queue-detail-backdrop" @click.self="closeDetail">
+          <section class="queue-detail-dialog" role="dialog" aria-modal="true" :aria-label="selectedDetail.title">
+            <header class="queue-detail-header">
+              <div>
+                <h2>{{ selectedDetail.title }}</h2>
+                <p v-if="selectedDetail.kind === 'registration'">{{ selectedDetail.locationLabel }}</p>
+                <p v-else>{{ selectedDetail.isPlaying ? selectedDetail.playingText : positionEstimateText(selectedDetail.estimate, selectedDetail.registrations, selectedDetail.machine) }}</p>
+              </div>
+              <button type="button" aria-label="关闭详情" title="关闭" @click="closeDetail">
+                <X :size="20" aria-hidden="true" />
+              </button>
+            </header>
+
+            <template v-if="selectedDetail.kind === 'position'">
+              <div class="queue-detail-pills">
+                <span>{{ selectedDetail.registrations.length }} 个登记</span>
+                <span v-if="!selectedDetail.machine.operational">
+                  机台已停止使用 · {{ stopReasonLabel(
+                    selectedDetail.machine.stopReason,
+                    selectedDetail.machine.stopReasonDetail
+                  ) }}
+                </span>
+                <span v-if="selectedDetail.registrations.some((registration) => registration.temporarilyAway)" class="is-absence">包含暂时离开</span>
+                <span v-if="selectedDetail.registrations.some((registration) => registration.deferredOnce)" class="is-absence">包含暂缓一轮</span>
+                <span v-if="selectedDetail.registrations.some((registration) => registration.noShowCount > 0)" class="is-warning">包含未到场记录</span>
+              </div>
+              <div class="queue-detail-registration-list">
+                <button v-for="registration in selectedDetail.registrations"
+                  :key="registration.registrationId || registration.displayId" type="button"
+                  :class="`is-${registrationTone(registration)}`"
+                  @click="openRegistrationFromPosition(registration)">
+                  <span>
+                    <strong>{{ registration.displayId }}</strong>
+                    <small>{{ registrationLabel(registration) }}</small>
+                  </span>
+                  <UserRoundCheck v-if="isMarkedRegistration(registration)" :size="16" aria-label="我的登记" />
+                  <ChevronRight v-else :size="17" aria-hidden="true" />
+                </button>
+              </div>
+            </template>
+
+            <template v-else>
+              <div class="queue-detail-pills">
+                <span :class="{ 'is-absence': absenceLabel(selectedDetail.registration) }">
+                  {{ absenceLabel(selectedDetail.registration) || preferenceLabel(selectedDetail.registration) }}
+                </span>
+                <span>{{ registrationTypeLabel(selectedDetail.registration) }}</span>
+                <span v-if="selectedDetail.registration.noShowCount > 0" class="is-warning">
+                  未到场 {{ selectedDetail.registration.noShowCount }} 次
+                </span>
+              </div>
+              <dl class="queue-detail-metadata">
+                <div>
+                  <dt>游玩偏好</dt>
+                  <dd>{{ preferenceLabel(selectedDetail.registration) }}</dd>
+                </div>
+                <div v-if="absenceLabel(selectedDetail.registration)">
+                  <dt>当前状态</dt>
+                  <dd>{{ absenceLabel(selectedDetail.registration) }}</dd>
+                </div>
+                <div v-if="selectedDetail.estimatedWaitMinutes !== null">
+                  <dt>预计游玩</dt>
+                  <dd>{{ positionEstimateText(selectedDetail.estimatedWaitMinutes, selectedDetail.locationRegistrations, selectedDetail.machine) }}</dd>
+                </div>
+                <div v-if="selectedDetail.registration.noShowCount > 0">
+                  <dt>未到场处理</dt>
+                  <dd>{{ noShowResultLabel(selectedDetail.registration) }}</dd>
+                </div>
+                <div v-if="selectedDetail.registration.qqNumber">
+                  <dt>QQ</dt>
+                  <dd>{{ selectedDetail.registration.qqNumber }}</dd>
+                </div>
+                <div v-if="!selectedDetail.machine.operational">
+                  <dt>机台状态</dt>
+                  <dd>停止使用 · {{ stopReasonLabel(
+                    selectedDetail.machine.stopReason,
+                    selectedDetail.machine.stopReasonDetail
+                  ) }}</dd>
+                </div>
+                <div>
+                  <dt>创建时间</dt>
+                  <dd>{{ fullTimeText(selectedDetail.registration.createdAt) }}</dd>
+                </div>
+                <div>
+                  <dt>上次游玩</dt>
+                  <dd>{{ fullTimeText(selectedDetail.registration.lastPlayedAt, '尚未游玩') }}</dd>
+                </div>
+              </dl>
+              <button v-if="selectedDetail.registration.registrationId && !isMarkedRegistration(selectedDetail.registration)"
+                class="queue-detail-primary" type="button" @click="requestMarkAsSelf(selectedDetail.registration)">
+                <UserRoundCheck :size="18" aria-hidden="true" />
+                标记为自己
+              </button>
+              <button v-else-if="isMarkedRegistration(selectedDetail.registration)"
+                class="queue-detail-secondary" type="button" @click="clearMarkedSelf(); closeDetail()">
+                取消标记为自己
+              </button>
+              <p class="queue-detail-privacy">
+                标记使用的昵称、QQ 号和公开登记标识仅保存在此浏览器中。
+              </p>
+            </template>
+          </section>
+        </div>
+      </Transition>
+
+      <Transition name="queue-dialog">
+        <div v-if="pendingSelfRegistration" class="queue-detail-backdrop"
+          @click.self="pendingSelfRegistration = null">
+          <section class="queue-confirm-dialog" role="alertdialog" aria-modal="true" aria-label="更换我的登记">
+            <h2>更换“我的排队”标记？</h2>
+            <p>当前标记的是“{{ markedSelf?.displayId }}”。确认后，将改为跟踪“{{ pendingSelfRegistration.displayId }}”。</p>
+            <div>
+              <button type="button" @click="pendingSelfRegistration = null">保留原标记</button>
+              <button type="button" class="primary" @click="confirmReplaceMarkedSelf">确认更换</button>
+            </div>
+          </section>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <footer class="queue-footer" :class="{ 'is-error': loadError }" aria-live="polite">
+      <span v-if="loadError && hasSnapshot">连接中断，当前显示上次同步结果</span>
+      <span v-else-if="hasSnapshot">现场数据每 10 秒自动刷新</span>
+    </footer>
+  </main>
+</template>
+
+<style scoped>
+.queue-panel {
+  --queue-page: #f5f5f7;
+  --queue-card: #ffffff;
+  --queue-position: #fafafc;
+  --queue-text: #1d1d1f;
+  --queue-secondary: #6e6e73;
+  --queue-tertiary: #8e8e93;
+  --queue-separator: #d2d2d7;
+  --queue-blue: #007aff;
+  --queue-soft-blue: #eaf3ff;
+  --queue-orange: #b85c00;
+  --queue-soft-orange: #fff1dc;
+  --queue-red: #c9342c;
+  --queue-soft-red: #ffefee;
+  --queue-disabled: #e8e8ed;
+  width: 100%;
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 6px 4px 36px;
+  color: var(--queue-text);
+}
+
+:global(.maimai-queue-page .VPPage) { background: var(--queue-page, #f5f5f7); }
+:global(html.dark .maimai-queue-page .VPPage) { background: #000000; }
+:global(html.dark .maimai-queue-page .queue-panel) {
+  --queue-page: #000000;
+  --queue-card: #1c1c1e;
+  --queue-position: #242426;
+  --queue-text: #f5f5f7;
+  --queue-secondary: #a1a1a6;
+  --queue-tertiary: #8e8e93;
+  --queue-separator: #38383a;
+  --queue-blue: #0a84ff;
+  --queue-soft-blue: #142b44;
+  --queue-orange: #ffb35c;
+  --queue-soft-orange: #3b2b13;
+  --queue-red: #ff6961;
+  --queue-soft-red: #3b1716;
+  --queue-disabled: #2c2c2e;
+}
+
+.queue-panel, .queue-panel * { box-sizing: border-box; letter-spacing: 0; }
+button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transparent; }
+.queue-header { display: flex; margin: 24px 4px 20px; flex-direction: column; gap: 18px; }
+.queue-heading h1 { margin: 0; border: 0; font-size: 34px; font-weight: 660; line-height: 1.15; letter-spacing: 0; }
+.queue-heading p { display: flex; margin: 7px 0 0; flex-wrap: wrap; gap: 0 6px; color: var(--queue-secondary); font-size: 13px; line-height: 1.55; }
+.queue-heading strong { color: var(--queue-text); font-weight: 560; }
+.queue-heading-separator { color: var(--queue-tertiary); }
+.queue-toolbar { display: flex; min-width: 0; flex-direction: column; gap: 12px; }
+.queue-view-tabs { display: grid; width: 100%; padding: 3px; grid-template-columns: 1fr 1fr; border-radius: 10px; background: color-mix(in srgb, var(--queue-separator) 42%, transparent); }
+.queue-view-tabs button { display: flex; min-height: 36px; align-items: center; justify-content: center; gap: 6px; border: 0; border-radius: 8px; color: var(--queue-secondary); background: transparent; cursor: pointer; font-size: 12px; transition: color .16s ease, background .16s ease, box-shadow .16s ease; }
+.queue-view-tabs button.active { color: var(--queue-text); background: var(--queue-card); box-shadow: 0 1px 3px rgba(0, 0, 0, .08); }
+.queue-system { display: grid; width: 100%; min-width: 0; grid-template-columns: auto 1px minmax(0, 1fr) 40px; align-items: center; gap: 10px; }
+.queue-system time { font-size: 16px; font-weight: 570; font-variant-numeric: tabular-nums; }
+.queue-system-divider { width: 1px; height: 16px; background: var(--queue-separator); }
+.queue-availability { display: flex; min-width: 0; align-items: center; gap: 7px; color: var(--queue-secondary); font-size: 12px; line-height: 1.35; }
+.queue-availability > span { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #8e8e93; }
+.queue-availability.is-closed > span { background: #ff9500; }
+.queue-availability.is-outside > span { background: #ff3b30; }
+.queue-refresh { display: grid; width: 40px; height: 40px; padding: 0; place-items: center; border: 1px solid color-mix(in srgb, var(--queue-separator) 72%, transparent); border-radius: 50%; color: var(--queue-text); background: var(--queue-card); cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .12s ease; }
+.queue-refresh:disabled { opacity: .55; }
+.queue-refresh:active:not(:disabled) { transform: scale(.95); }
+.queue-refresh:focus-visible, button:focus-visible, [role='button']:focus-visible { outline: 2px solid var(--queue-blue); outline-offset: 2px; }
+.spinning { animation: queue-spin .8s linear infinite; }
+
+.queue-self { display: grid; margin: 0 0 18px; padding: 17px 18px; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: start; gap: 13px; border: 1px solid color-mix(in srgb, var(--queue-blue) 28%, var(--queue-separator)); border-radius: 14px; background: color-mix(in srgb, var(--queue-soft-blue) 72%, var(--queue-card)); }
+.queue-self.is-warning { border-color: color-mix(in srgb, #ff9500 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-orange) 74%, var(--queue-card)); }
+.queue-self.is-danger { border-color: color-mix(in srgb, var(--queue-red) 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-red) 76%, var(--queue-card)); }
+.queue-self.is-muted { border-color: var(--queue-separator); background: var(--queue-card); }
+.queue-self-icon { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 50%; color: var(--queue-blue); background: var(--queue-card); }
+.queue-self.is-warning .queue-self-icon { color: var(--queue-orange); }
+.queue-self.is-danger .queue-self-icon { color: var(--queue-red); }
+.queue-self-main { min-width: 0; }
+.queue-self-eyebrow { color: var(--queue-secondary); font-size: 10px; font-weight: 600; }
+.queue-self h2 { margin: 1px 0 0; border: 0; font-size: 19px; font-weight: 650; line-height: 1.3; letter-spacing: 0; overflow-wrap: anywhere; }
+.queue-self-main > strong { display: block; margin-top: 7px; font-size: 13px; font-weight: 620; line-height: 1.45; }
+.queue-self-main > p { margin: 3px 0 0; color: var(--queue-secondary); font-size: 11px; line-height: 1.6; }
+.queue-self-facts { display: flex; margin-top: 9px; flex-wrap: wrap; gap: 6px; }
+.queue-self-facts span { display: flex; padding: 4px 7px; align-items: center; gap: 4px; border-radius: 6px; color: var(--queue-secondary); background: color-mix(in srgb, var(--queue-card) 82%, transparent); font-size: 10px; }
+.queue-self-clear { padding: 7px 8px; border: 0; color: var(--queue-secondary); background: transparent; cursor: pointer; font-size: 11px; }
+
+.queue-unavailable { display: flex; min-height: 184px; padding: 28px 22px; align-items: center; gap: 15px; border: 1px solid var(--queue-separator); border-radius: 14px; background: var(--queue-card); }
+.queue-unavailable-icon { display: grid; width: 44px; height: 44px; flex: 0 0 auto; place-items: center; border-radius: 50%; color: var(--queue-secondary); background: var(--queue-position); }
+.queue-unavailable h2, .queue-machine-message p { margin: 0; border: 0; font-size: 18px; font-weight: 600; line-height: 1.35; }
+.queue-unavailable p, .queue-machine-message span { display: block; margin: 6px 0 0; color: var(--queue-secondary); font-size: 12px; line-height: 1.6; }
+.queue-natural-notice { display: flex; margin-bottom: 16px; padding: 13px 15px; align-items: flex-start; gap: 10px; border-left: 3px solid #34c759; color: var(--queue-secondary); background: color-mix(in srgb, #34c759 7%, var(--queue-card)); }
+.queue-natural-notice svg { flex: 0 0 auto; color: #248a3d; }
+.queue-natural-notice.is-outside { border-left-color: #ff9500; background: color-mix(in srgb, var(--queue-soft-orange) 72%, var(--queue-card)); }
+.queue-natural-notice.is-outside svg { color: var(--queue-orange); }
+.queue-natural-notice strong, .queue-natural-notice span { display: block; }
+.queue-natural-notice strong { color: var(--queue-text); font-size: 13px; }
+.queue-natural-notice span { margin-top: 2px; font-size: 11px; line-height: 1.5; }
+
+.queue-machine-list { display: grid; gap: 16px; }
+.queue-machine { min-width: 0; padding: 17px; border: 1px solid color-mix(in srgb, var(--queue-separator) 74%, transparent); border-radius: 14px; background: var(--queue-card); }
+.queue-machine-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.queue-machine-header > div { min-width: 0; }
+.queue-machine-header h2 { margin: 0; border: 0; font-size: 19px; font-weight: 620; line-height: 1.35; letter-spacing: 0; }
+.queue-machine-header p { margin: 3px 0 0; color: var(--queue-secondary); font-size: 11px; line-height: 1.45; }
+.queue-machine-state { padding: 5px 8px; flex: 0 0 auto; border-radius: 6px; color: var(--queue-orange); background: var(--queue-soft-orange); font-size: 10px; font-weight: 650; }
+.queue-machine-message { display: flex; min-height: 142px; padding: 24px 8px 8px; justify-content: center; flex-direction: column; }
+.queue-machine-message.is-stopped { min-height: 0; margin-top: 12px; padding: 12px 13px; border-radius: 9px; background: color-mix(in srgb, var(--queue-soft-orange) 82%, var(--queue-position)); }
+.queue-machine-message.is-stopped p { font-size: 13px; }
+.queue-machine-message.is-stopped span { margin-top: 3px; }
+.queue-position-list { display: grid; margin-top: 14px; gap: 10px; }
+.queue-position { min-width: 0; padding: 11px; border: 1px solid var(--queue-separator); border-radius: 11px; background: var(--queue-position); }
+.queue-position.is-playing { border-color: color-mix(in srgb, var(--queue-blue) 25%, var(--queue-separator)); background: var(--queue-soft-blue); }
+.queue-position.is-actionable { cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .14s ease; -webkit-tap-highlight-color: transparent; }
+.queue-position.is-actionable:hover { border-color: color-mix(in srgb, var(--queue-blue) 42%, var(--queue-separator)); }
+.queue-position.is-actionable:active { transform: scale(.997); }
+.queue-position > header { display: flex; min-height: 25px; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.queue-position > header > span, .queue-position-heading > span { color: var(--queue-tertiary); font-size: 11px; font-weight: 580; line-height: 1.4; }
+.queue-position.is-playing > header > span { color: var(--queue-blue); }
+.queue-position > header > svg { margin-top: -1px; flex: 0 0 auto; color: var(--queue-tertiary); }
+.queue-position-heading { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.queue-position-heading small { color: var(--queue-secondary); font-size: 10px; font-weight: 450; line-height: 1.45; }
+.queue-position-empty { display: grid; min-height: 72px; place-items: center; color: var(--queue-tertiary); font-size: 12px; }
+.queue-registration-grid { display: grid; min-width: 0; margin-top: 6px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.queue-overtime:only-child { grid-column: 1 / -1; }
+.queue-registration, .queue-overtime { min-width: 0; min-height: 70px; border-radius: 8px; background: var(--queue-card); }
+.queue-registration { position: relative; display: flex; padding: 10px 28px 10px 10px; justify-content: center; flex-direction: column; border: 1px solid transparent; color: inherit; text-align: left; cursor: pointer; transition: background .16s ease, border-color .16s ease, transform .12s ease; -webkit-tap-highlight-color: transparent; }
+.queue-registration:hover { background: color-mix(in srgb, var(--queue-soft-blue) 50%, var(--queue-card)); }
+.queue-registration:active { transform: scale(.985); }
+.queue-position.is-playing .queue-registration { border-color: color-mix(in srgb, var(--queue-blue) 8%, transparent); background: color-mix(in srgb, var(--queue-card) 90%, var(--queue-soft-blue)); }
+.queue-registration.is-absence { background: color-mix(in srgb, var(--queue-soft-orange) 72%, var(--queue-card)); }
+.queue-registration.is-warning { border-color: color-mix(in srgb, var(--queue-red) 22%, transparent); background: color-mix(in srgb, var(--queue-soft-red) 72%, var(--queue-card)); }
+.queue-registration.is-self { border-color: color-mix(in srgb, var(--queue-blue) 54%, var(--queue-separator)); }
+.queue-registration > svg { position: absolute; top: 50%; right: 8px; color: var(--queue-tertiary); transform: translateY(-50%); }
+.queue-registration.is-self > svg { color: var(--queue-blue); }
+.queue-registration strong { overflow: hidden; font-size: 14px; font-weight: 570; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.queue-registration span { margin-top: 4px; color: var(--queue-secondary); font-size: 10px; line-height: 1.35; }
+.queue-registration.is-absence span { color: var(--queue-orange); font-weight: 570; }
+.queue-registration.is-warning span { color: var(--queue-red); font-weight: 570; }
+.queue-overtime { display: flex; padding: 10px; justify-content: center; flex-direction: column; color: var(--queue-orange); background: var(--queue-soft-orange); }
+.queue-overtime strong { font-size: 11px; line-height: 1.4; }
+.queue-overtime span { margin-top: 4px; font-size: 9px; line-height: 1.45; }
+
+.queue-logs { padding: 17px; border: 1px solid var(--queue-separator); border-radius: 14px; background: var(--queue-card); }
+.queue-logs-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.queue-logs-header h2 { margin: 0; border: 0; font-size: 20px; font-weight: 630; letter-spacing: 0; }
+.queue-logs-header p { margin: 4px 0 0; color: var(--queue-secondary); font-size: 11px; line-height: 1.5; }
+.queue-log-filter-groups { display: flex; min-width: 0; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+.queue-log-filters { display: flex; padding: 3px; flex: 0 0 auto; border-radius: 9px; background: var(--queue-position); }
+.queue-log-filters button { min-height: 30px; padding: 0 9px; border: 0; border-radius: 7px; color: var(--queue-secondary); background: transparent; cursor: pointer; font-size: 10px; transition: color .16s ease, background .16s ease, box-shadow .16s ease; }
+.queue-log-filters button.active { color: var(--queue-text); background: var(--queue-card); box-shadow: 0 1px 3px rgba(0, 0, 0, .08); }
+.queue-log-list { margin: 17px 0 0; padding: 0; list-style: none; border-top: 1px solid var(--queue-separator); }
+.queue-log-list li { display: grid; padding: 14px 2px; grid-template-columns: 112px minmax(0, 1fr); gap: 18px; border-bottom: 1px solid var(--queue-separator); }
+.queue-log-list li.is-self { margin: 0 -9px; padding-right: 11px; padding-left: 11px; border-radius: 8px; background: var(--queue-soft-blue); }
+.queue-log-time time, .queue-log-time span { display: block; }
+.queue-log-time time { color: var(--queue-secondary); font-size: 10px; font-variant-numeric: tabular-nums; line-height: 1.45; }
+.queue-log-time span { margin-top: 3px; color: var(--queue-tertiary); font-size: 9px; }
+.queue-log-body { min-width: 0; }
+.queue-log-title { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.queue-log-title strong { font-size: 13px; font-weight: 610; line-height: 1.4; }
+.queue-log-title span, .queue-log-title em { padding: 3px 6px; border-radius: 5px; color: var(--queue-secondary); background: var(--queue-position); font-size: 9px; font-style: normal; line-height: 1.3; }
+.queue-log-title em { color: var(--queue-blue); background: var(--queue-soft-blue); }
+.queue-log-body p { margin: 5px 0 0; color: var(--queue-secondary); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.queue-logs-empty { display: flex; min-height: 210px; padding: 28px; align-items: center; justify-content: center; flex-direction: column; gap: 7px; color: var(--queue-tertiary); text-align: center; }
+.queue-logs-empty strong { color: var(--queue-text); font-size: 14px; }
+.queue-logs-empty span { max-width: 420px; color: var(--queue-secondary); font-size: 11px; line-height: 1.6; }
+.queue-logs-empty.is-error svg { color: var(--queue-orange); }
+.queue-logs-empty button, .queue-load-more { min-height: 36px; margin-top: 6px; padding: 0 13px; border: 1px solid var(--queue-separator); border-radius: 8px; color: var(--queue-text); background: var(--queue-card); cursor: pointer; font-size: 11px; }
+.queue-load-more { display: block; margin: 14px auto 0; }
+
+.queue-detail-backdrop { position: fixed; z-index: 10000; inset: 0; display: grid; padding: 18px; place-items: center; background: rgba(0, 0, 0, .42); }
+.queue-detail-dialog, .queue-confirm-dialog { --queue-card: #fff; --queue-position: #f5f5f7; --queue-text: #1d1d1f; --queue-secondary: #6e6e73; --queue-tertiary: #8e8e93; --queue-separator: #d2d2d7; --queue-blue: #007aff; --queue-soft-blue: #eaf3ff; --queue-orange: #b85c00; --queue-soft-orange: #fff1dc; width: min(100%, 480px); max-height: min(680px, calc(100vh - 36px)); padding: 20px; overflow-y: auto; border: 1px solid var(--queue-separator); border-radius: 16px; color: var(--queue-text); background: var(--queue-card); box-shadow: 0 20px 54px rgba(0, 0, 0, .22); }
+:global(html.dark) .queue-detail-dialog, :global(html.dark) .queue-confirm-dialog { --queue-card: #1c1c1e; --queue-position: #242426; --queue-text: #f5f5f7; --queue-secondary: #a1a1a6; --queue-tertiary: #8e8e93; --queue-separator: #38383a; --queue-blue: #0a84ff; --queue-soft-blue: #142b44; --queue-orange: #ffb35c; --queue-soft-orange: #3b2b13; }
+.queue-detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.queue-detail-header > div { min-width: 0; }
+.queue-detail-header h2, .queue-confirm-dialog h2 { margin: 0; border: 0; overflow-wrap: anywhere; font-size: 22px; font-weight: 640; line-height: 1.3; letter-spacing: 0; }
+.queue-detail-header p { margin: 4px 0 0; color: var(--queue-secondary); font-size: 12px; }
+.queue-detail-header > button { display: grid; width: 38px; height: 38px; padding: 0; flex: 0 0 auto; place-items: center; border: 0; border-radius: 50%; color: var(--queue-secondary); background: var(--queue-position); cursor: pointer; }
+.queue-detail-pills { display: flex; margin-top: 16px; flex-wrap: wrap; gap: 7px; }
+.queue-detail-pills span { padding: 5px 8px; border-radius: 6px; color: var(--queue-secondary); background: var(--queue-position); font-size: 10px; line-height: 1.35; }
+.queue-detail-pills span.is-absence { color: var(--queue-orange); background: var(--queue-soft-orange); }
+.queue-detail-pills span.is-warning { color: var(--queue-red); background: var(--queue-soft-red); }
+.queue-detail-registration-list { display: grid; margin-top: 16px; gap: 8px; }
+.queue-detail-registration-list button { display: flex; min-width: 0; min-height: 54px; padding: 10px 12px; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--queue-separator); border-radius: 9px; color: var(--queue-text); background: var(--queue-position); text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .12s ease; }
+.queue-detail-registration-list button:active { transform: scale(.99); }
+.queue-detail-registration-list button.is-absence { border-color: color-mix(in srgb, var(--queue-orange) 18%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-orange) 72%, var(--queue-position)); }
+.queue-detail-registration-list button.is-warning { border-color: color-mix(in srgb, var(--queue-red) 18%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-red) 72%, var(--queue-position)); }
+.queue-detail-registration-list button > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.queue-detail-registration-list strong { overflow-wrap: anywhere; font-size: 13px; font-weight: 580; }
+.queue-detail-registration-list small { color: var(--queue-secondary); font-size: 10px; }
+.queue-detail-registration-list button.is-absence small { color: var(--queue-orange); }
+.queue-detail-registration-list button.is-warning small { color: var(--queue-red); }
+.queue-detail-registration-list svg { flex: 0 0 auto; color: var(--queue-tertiary); }
+.queue-detail-metadata { margin: 18px 0 0; border-top: 1px solid var(--queue-separator); }
+.queue-detail-metadata > div { display: grid; min-height: 44px; padding: 9px 0; grid-template-columns: minmax(82px, auto) minmax(0, 1fr); align-items: center; gap: 16px; border-bottom: 1px solid var(--queue-separator); }
+.queue-detail-metadata dt, .queue-detail-metadata dd { margin: 0; font-size: 11px; line-height: 1.5; }
+.queue-detail-metadata dt { color: var(--queue-tertiary); }
+.queue-detail-metadata dd { overflow-wrap: anywhere; text-align: right; }
+.queue-detail-primary, .queue-detail-secondary { display: flex; width: 100%; min-height: 44px; margin-top: 17px; padding: 0 14px; align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: 9px; cursor: pointer; font-size: 12px; font-weight: 600; transition: filter .16s ease, transform .12s ease; }
+.queue-detail-primary:active, .queue-detail-secondary:active { transform: scale(.99); }
+.queue-detail-primary { color: #fff; background: var(--queue-blue); }
+.queue-detail-secondary { color: var(--queue-text); background: var(--queue-position); }
+.queue-detail-privacy { max-width: 34em; margin: 8px auto 0; color: var(--queue-tertiary); font-size: 10px; line-height: 1.5; text-align: center; text-wrap: balance; }
+.queue-confirm-dialog { width: min(100%, 420px); }
+.queue-confirm-dialog p { margin: 8px 0 0; color: var(--queue-secondary); font-size: 12px; line-height: 1.65; }
+.queue-confirm-dialog > div { display: grid; margin-top: 18px; grid-template-columns: 1fr 1fr; gap: 8px; }
+.queue-confirm-dialog button { min-height: 42px; border: 0; border-radius: 9px; color: var(--queue-text); background: var(--queue-position); cursor: pointer; font-size: 11px; font-weight: 580; }
+.queue-confirm-dialog button.primary { color: #fff; background: var(--queue-blue); }
+.queue-dialog-enter-active, .queue-dialog-leave-active { transition: opacity .18s ease; }
+.queue-dialog-enter-active .queue-detail-dialog, .queue-dialog-enter-active .queue-confirm-dialog, .queue-dialog-leave-active .queue-detail-dialog, .queue-dialog-leave-active .queue-confirm-dialog { transition: transform .2s ease, opacity .18s ease; }
+.queue-dialog-enter-from, .queue-dialog-leave-to { opacity: 0; }
+.queue-dialog-enter-from .queue-detail-dialog, .queue-dialog-enter-from .queue-confirm-dialog, .queue-dialog-leave-to .queue-detail-dialog, .queue-dialog-leave-to .queue-confirm-dialog { opacity: 0; transform: translateY(8px) scale(.985); }
+.queue-footer { min-height: 38px; padding: 14px 4px 0; color: var(--queue-tertiary); font-size: 11px; text-align: center; }
+.queue-footer.is-error { color: var(--queue-orange); }
+
+@media (min-width: 620px) {
+  .queue-header { align-items: flex-end; flex-direction: row; justify-content: space-between; }
+  .queue-toolbar { width: auto; align-items: center; flex-direction: row; }
+  .queue-view-tabs { width: 190px; }
+  .queue-system { width: auto; grid-template-columns: auto 1px minmax(92px, auto) 40px; }
+  .queue-position-list { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  .queue-position.is-playing { grid-column: 1 / -1; }
+  .queue-position.is-playing .queue-registration-grid:has(> .queue-overtime):has(> .queue-registration + .queue-registration) {
+    grid-template-columns: minmax(0, 1.25fr) repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 820px) {
+  .queue-panel { padding-top: 12px; }
+  .queue-heading h1 { font-size: 38px; }
+}
+
+@media (min-width: 1100px) {
+  .queue-machine-list { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+}
+
+@media (max-width: 619px) {
+  .queue-position.is-playing .queue-registration-grid:has(> .queue-overtime) > .queue-overtime {
+    grid-column: 1 / -1;
+  }
+  .queue-position.is-playing .queue-overtime + .queue-registration:last-child {
+    grid-column: 1 / -1;
+  }
+  .queue-self { grid-template-columns: 38px minmax(0, 1fr); padding: 15px; }
+  .queue-self-icon { width: 38px; height: 38px; }
+  .queue-self-clear { grid-column: 2; justify-self: start; padding: 4px 0; }
+  .queue-logs { padding: 15px; }
+  .queue-logs-header { align-items: stretch; flex-direction: column; }
+  .queue-log-filter-groups { align-items: stretch; flex-direction: column; }
+  .queue-log-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(64px, 1fr)); }
+  .queue-log-filters button { padding: 0 5px; }
+  .queue-log-list li { grid-template-columns: 1fr; gap: 7px; }
+  .queue-log-time { display: flex; align-items: center; gap: 7px; }
+  .queue-log-time span { margin: 0; }
+  .queue-detail-backdrop { padding: 10px; align-items: end; }
+  .queue-detail-dialog, .queue-confirm-dialog { width: 100%; max-height: calc(100vh - 20px); padding: 18px; border-radius: 14px; }
+}
+
+@media (max-width: 370px) {
+  .queue-registration-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinning { animation: none; }
+  .queue-dialog-enter-active, .queue-dialog-leave-active,
+  .queue-dialog-enter-active .queue-detail-dialog, .queue-dialog-enter-active .queue-confirm-dialog,
+  .queue-dialog-leave-active .queue-detail-dialog, .queue-dialog-leave-active .queue-confirm-dialog { transition: none; }
+}
+
+@keyframes queue-spin { to { transform: rotate(360deg); } }
+</style>

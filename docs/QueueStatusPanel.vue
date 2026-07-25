@@ -6,6 +6,7 @@ import {
   MapPin,
   RefreshCw,
   TriangleAlert,
+  UserPlus,
   UserRoundCheck,
   Users,
   WifiOff,
@@ -16,7 +17,14 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL || 'https://abcccc.top/api/queue-status'
 const QUEUE_LOG_API_URL = import.meta.env.VITE_QUEUE_LOG_API_URL ||
   QUEUE_API_URL.replace(/queue-status(?:\?.*)?$/, 'queue-logs')
+const QUEUE_ONLINE_PROFILE_API_URL = import.meta.env.VITE_QUEUE_ONLINE_PROFILE_API_URL ||
+  QUEUE_API_URL.replace(/queue-status(?:\?.*)?$/, 'queue-online/profile')
+const QUEUE_ONLINE_JOIN_API_URL = import.meta.env.VITE_QUEUE_ONLINE_JOIN_API_URL ||
+  QUEUE_API_URL.replace(/queue-status(?:\?.*)?$/, 'queue-online/join')
+const QUEUE_ONLINE_COMMAND_API_BASE = import.meta.env.VITE_QUEUE_ONLINE_COMMAND_API_BASE ||
+  QUEUE_API_URL.replace(/queue-status(?:\?.*)?$/, 'queue-online/commands')
 const REFRESH_INTERVAL = 10000
+const ONLINE_COMMAND_POLL_INTERVAL = 1500
 const SELF_STORAGE_KEY = 'maimai-q:marked-registration:v1'
 const MAX_SELF_REGISTRATION_HISTORY = 24
 
@@ -65,8 +73,22 @@ const logSourceFilter = ref('ALL')
 const markedSelfLogs = ref([])
 const selfStorageAvailable = ref(true)
 const currentTime = ref(Date.now())
+const onlineJoinVisible = ref(false)
+const onlineJoinStep = ref('LOOKUP')
+const onlineJoinQq = ref('')
+const onlineJoinMachineId = ref('A')
+const onlineJoinProfile = ref(null)
+const onlineJoinMachines = ref([])
+const onlineJoinExistingRegistration = ref(null)
+const onlineJoinPreference = ref(null)
+const onlineJoinLoading = ref(false)
+const onlineJoinError = ref('')
+const onlineJoinCommandId = ref(null)
+const onlineJoinQueueId = ref(null)
+const onlineJoinResultDetail = ref('')
 let refreshTimer
 let clockTimer
+let onlineCommandTimer
 
 const totalRegistrationCount = computed(() => (
   machines.value.reduce((total, machine) => total + machine.registrationCount, 0)
@@ -74,6 +96,52 @@ const totalRegistrationCount = computed(() => (
 
 const terminalOnline = computed(() => (
   hasSnapshot.value && terminal.value?.online !== false
+))
+
+const onlineRegistrationAvailable = computed(() => (
+  hasSnapshot.value &&
+  terminalOnline.value &&
+  capabilities.value?.online_registration === true &&
+  registrationOpen.value !== false &&
+  machines.value.some((machine) => (
+    machine.synced && machine.operational && machine.registrationCount < 20
+  ))
+))
+
+const onlineRegistrationSummary = computed(() => {
+  if (!hasSnapshot.value || !terminalOnline.value) return '现场终端离线，暂不能线上加入排队'
+  if (capabilities.value?.online_registration !== true) return '现场暂未开放线上登记'
+  if (registrationOpen.value === false) {
+    return outsideBusinessHours.value ? '当前不接收新的排队登记' : '当前采用现场自然排队'
+  }
+  if (!machines.value.some((machine) => (
+    machine.synced && machine.operational && machine.registrationCount < 20
+  ))) return '当前没有可以接收新登记的机台'
+  return '使用现场玩家资料加入；到场后需要在终端完成签到'
+})
+
+const onlineJoinMachineOptions = computed(() => {
+  const remote = onlineJoinMachines.value
+  if (remote.length) return remote
+  return machines.value.map((machine) => ({
+    id: machine.id,
+    name: machine.name,
+    operational: machine.operational,
+    registrationCount: machine.registrationCount,
+    estimatedWaitMinutes: null,
+    available: machine.synced && machine.operational && machine.registrationCount < 20,
+    unavailableReason: !machine.operational
+      ? '机台已停止使用'
+      : machine.registrationCount >= 20 ? '登记已满' : null
+  }))
+})
+
+const selectedOnlineJoinMachine = computed(() => (
+  onlineJoinMachineOptions.value.find((machine) => machine.id === onlineJoinMachineId.value) || null
+))
+
+const onlineJoinNeedsPreference = computed(() => (
+  onlineJoinProfile.value?.defaultPreference === 'ASK_EVERY_TIME'
 ))
 
 const availability = computed(() => {
@@ -252,6 +320,7 @@ function normalizeRegistration(source, index) {
       fixedPairId: null,
       noShowCount: 0,
       lastNoShowActionWasDefer: false,
+      onlineRegistrationPendingCheckIn: false,
       registrationType: 'TEMPORARY',
       qqNumber: null
     }
@@ -272,6 +341,9 @@ function normalizeRegistration(source, index) {
     noShowCount: toNonNegativeInteger(source?.no_show_count ?? source?.noShowCount) ?? 0,
     lastNoShowActionWasDefer: source?.last_no_show_action_was_defer === true ||
       source?.lastNoShowActionWasDefer === true,
+    onlineRegistrationPendingCheckIn:
+      source?.online_registration_pending_check_in === true ||
+      source?.onlineRegistrationPendingCheckIn === true,
     registrationType: String(
       source?.registration_type || source?.registrationType || 'TEMPORARY'
     ).toUpperCase(),
@@ -730,13 +802,15 @@ function absenceLabel(registration) {
 }
 
 function registrationLabel(registration) {
-  return absenceLabel(registration) ||
+  return (registration.onlineRegistrationPendingCheckIn ? '线上登记 · 待签到' : null) ||
+    absenceLabel(registration) ||
     (registration.noShowCount > 0 ? `未到场 ${registration.noShowCount} 次` : null) ||
     (registration.fixedPair ? '固定组合' : null) ||
     (registration.preference === 'SOLO' ? '单人游玩' : '允许他人加入')
 }
 
 function registrationTone(registration) {
+  if (registration.onlineRegistrationPendingCheckIn) return 'online'
   if (registration.temporarilyAway || registration.deferredOnce) return 'absence'
   if (registration.noShowCount > 0) return 'warning'
   return 'normal'
@@ -744,6 +818,9 @@ function registrationTone(registration) {
 
 function positionEstimateText(minutes, registrations = [], machine = null) {
   if (machine?.operational === false) return '机台恢复使用后重新估算'
+  if (registrations.some((registration) => registration.onlineRegistrationPendingCheckIn)) {
+    return '签到后可估算'
+  }
   if (registrations.some((registration) => registration.temporarilyAway)) {
     return '暂时离开，无法估算'
   }
@@ -840,6 +917,7 @@ function markedSelfStatusTitle() {
   }
   const registration = location.registration
   if (!location.machine.operational) return `${location.machine.name} 已停止使用`
+  if (registration.onlineRegistrationPendingCheckIn) return '你还没有完成现场签到'
   if (registration.temporarilyAway) return '你当前处于暂时离开状态'
   if (registration.deferredOnce) return '你已暂缓一轮'
   if (location.kind === 'PLAYING') return '现在轮到你游玩'
@@ -868,13 +946,16 @@ function markedSelfStatusDetail() {
       location.machine.stopReasonDetail
     )}。登记顺序仍然保留，机台恢复正常使用后会重新开始本轮计时。`
   }
+  if (registration.onlineRegistrationPendingCheckIn) {
+    return '这份线上登记已经保留在当前顺序。到达现场后，请在终端点击自己的登记并选择“已到场”；完成签到前不会进入游玩位置。'
+  }
   if (registration.temporarilyAway) {
     const skipped = registration.temporaryAwaySkippedTurns
     return skipped > 0
       ? `排队时会暂时忽略这份登记，目前已轮空 ${skipped} 次；第四次轮到时仍未解除，将退出排队。`
-      : '排队时会暂时忽略这份登记。需要在终端手动解除，才能再次被安排上机。'
+      : '排队时会暂时忽略这份登记。需要在终端手动解除，才能再次进入游玩位置。'
   }
-  if (registration.deferredOnce) return '本次上机机会会被跳过，轮到下一组时将自动解除。'
+  if (registration.deferredOnce) return '本次进入游玩位置的机会会被跳过，轮到下一组时将自动解除。'
   if (location.kind === 'PLAYING') return markedSelfPartnerText.value
   return markedSelfPartnerText.value
 }
@@ -888,6 +969,7 @@ function markedSelfTone() {
       ? 'danger'
       : 'muted'
   }
+  if (location.registration.onlineRegistrationPendingCheckIn) return 'online'
   if (location.registration.noShowCount > 0) return 'danger'
   if (!location.machine.operational || location.registration.temporarilyAway ||
     location.registration.deferredOnce) return 'warning'
@@ -952,9 +1034,313 @@ function eventIsMarkedSelf(event) {
   ))
 }
 
+function createRequestId() {
+  if (typeof window.crypto?.randomUUID === 'function') return window.crypto.randomUUID()
+  const bytes = new Uint8Array(16)
+  window.crypto.getRandomValues(bytes)
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const value = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`
+}
+
+function normalizeOnlineMachine(source) {
+  const id = String(source?.id || '').toUpperCase()
+  const registrationCount = toNonNegativeInteger(
+    source?.registration_count ?? source?.registrationCount
+  ) ?? 0
+  const operational = source?.operational !== false
+  const available = source?.available === true && operational && registrationCount < 20
+  return {
+    id,
+    name: String(source?.name || `机台 ${id}`),
+    operational,
+    registrationCount,
+    estimatedWaitMinutes: toNonNegativeInteger(
+      source?.estimated_wait_minutes ?? source?.estimatedWaitMinutes
+    ),
+    available,
+    unavailableReason: source?.unavailable_reason ?? source?.unavailableReason ??
+      (!operational ? '机台已停止使用' : registrationCount >= 20 ? '登记已满' : null)
+  }
+}
+
+function normalizeOnlineProfile(source) {
+  if (!source || typeof source !== 'object') return null
+  const qqNumber = normalizeQqNumber(source.qq_number ?? source.qqNumber)
+  const nickname = String(source.nickname || '').trim()
+  const defaultPreference = String(
+    source.default_preference ?? source.defaultPreference ?? ''
+  ).toUpperCase()
+  if (!qqNumber || !nickname || !['SOLO', 'OPEN_TO_JOIN', 'ASK_EVERY_TIME'].includes(defaultPreference)) {
+    return null
+  }
+  return {
+    profileId: source.profile_id ?? source.profileId ?? null,
+    nickname,
+    qqNumber,
+    gender: String(source.gender || 'UNDISCLOSED').toUpperCase(),
+    defaultPreference
+  }
+}
+
+async function readJsonResponse(response) {
+  const data = await response.json().catch(() => null)
+  if (!response.ok) {
+    const error = new Error(data?.error || `服务器返回 HTTP ${response.status}`)
+    error.code = data?.code || null
+    throw error
+  }
+  return data || {}
+}
+
+function firstAvailableOnlineMachineId() {
+  return onlineJoinMachineOptions.value.find((machine) => machine.available)?.id || 'A'
+}
+
+function resetOnlineJoin() {
+  if (onlineCommandTimer) window.clearTimeout(onlineCommandTimer)
+  onlineCommandTimer = null
+  onlineJoinStep.value = 'LOOKUP'
+  onlineJoinQq.value = ''
+  onlineJoinMachineId.value = firstAvailableOnlineMachineId()
+  onlineJoinProfile.value = null
+  onlineJoinMachines.value = []
+  onlineJoinExistingRegistration.value = null
+  onlineJoinPreference.value = null
+  onlineJoinLoading.value = false
+  onlineJoinError.value = ''
+  onlineJoinCommandId.value = null
+  onlineJoinQueueId.value = null
+  onlineJoinResultDetail.value = ''
+}
+
+function openOnlineJoin() {
+  if (!onlineRegistrationAvailable.value) return
+  if (!['PENDING', 'REJECTED'].includes(onlineJoinStep.value)) resetOnlineJoin()
+  onlineJoinVisible.value = true
+}
+
+function closeOnlineJoin() {
+  onlineJoinVisible.value = false
+}
+
+function handleOnlineJoinQqInput(event) {
+  onlineJoinQq.value = String(event.target.value || '').replace(/\D/g, '').slice(0, 12)
+  onlineJoinError.value = ''
+}
+
+function selectOnlineJoinMachine(machine) {
+  if (!machine.available || onlineJoinLoading.value) return
+  onlineJoinMachineId.value = machine.id
+  onlineJoinCommandId.value = null
+  onlineJoinError.value = ''
+}
+
+function selectOnlineJoinPreference(preference) {
+  onlineJoinPreference.value = preference
+  onlineJoinCommandId.value = null
+  onlineJoinError.value = ''
+}
+
+async function queryOnlineProfile() {
+  const qqNumber = normalizeQqNumber(onlineJoinQq.value)
+  if (!qqNumber) {
+    onlineJoinError.value = '请输入 5 至 12 位 QQ 号。'
+    return
+  }
+  if (!selectedOnlineJoinMachine.value?.available) {
+    onlineJoinError.value = '请选择当前可以接收新登记的机台。'
+    return
+  }
+  onlineJoinLoading.value = true
+  onlineJoinError.value = ''
+  try {
+    const response = await fetch(QUEUE_ONLINE_PROFILE_API_URL, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ qq: qqNumber })
+    })
+    const data = await readJsonResponse(response)
+    const profile = normalizeOnlineProfile(data.profile)
+    if (!profile) throw new Error('服务器返回的玩家资料不完整，请在现场终端检查资料。')
+    onlineJoinProfile.value = profile
+    onlineJoinQueueId.value = data.queue_id ?? data.queueId ?? queueId.value
+    onlineJoinMachines.value = Array.isArray(data.machines)
+      ? data.machines.map(normalizeOnlineMachine).filter((machine) => machine.id)
+      : []
+    onlineJoinExistingRegistration.value = data.existing_registration ??
+      data.existingRegistration ?? null
+    onlineJoinPreference.value = profile.defaultPreference === 'ASK_EVERY_TIME'
+      ? null
+      : profile.defaultPreference
+    onlineJoinStep.value = onlineJoinExistingRegistration.value ? 'EXISTING' : 'CONFIRM'
+  } catch (error) {
+    onlineJoinError.value = error?.message || '暂时无法查询玩家资料，请稍后重试。'
+  } finally {
+    onlineJoinLoading.value = false
+  }
+}
+
+function backToOnlineLookup() {
+  onlineJoinStep.value = 'LOOKUP'
+  onlineJoinProfile.value = null
+  onlineJoinMachines.value = []
+  onlineJoinExistingRegistration.value = null
+  onlineJoinPreference.value = null
+  onlineJoinCommandId.value = null
+  onlineJoinError.value = ''
+}
+
+function playerGenderText(gender) {
+  if (gender === 'MALE') return '♂'
+  if (gender === 'FEMALE') return '♀'
+  return '—'
+}
+
+function playerGenderLabel(gender) {
+  if (gender === 'MALE') return '男'
+  if (gender === 'FEMALE') return '女'
+  return '不愿透露'
+}
+
+function profilePreferenceText(preference) {
+  if (preference === 'SOLO') return '单人游玩'
+  if (preference === 'OPEN_TO_JOIN') return '允许他人加入'
+  return '每次询问'
+}
+
+function onlineMachineEstimateText(machine) {
+  if (!machine?.available) return machine?.unavailableReason || '当前不可加入'
+  const minutes = machine.estimatedWaitMinutes
+  if (minutes === null || minutes === undefined) return '暂时无法估算'
+  if (minutes <= 0) return '预计现在可以游玩'
+  return `新登记约 ${minutes} 分钟后可以游玩`
+}
+
+function existingOnlineRegistrationText() {
+  const existing = onlineJoinExistingRegistration.value
+  if (!existing) return ''
+  const machineId = existing.machine_id ?? existing.machineId
+  const position = existing.position
+  const positionIndex = existing.position_index ?? existing.positionIndex
+  if (position === 'PLAYING') return `游玩位置 ${machineId}`
+  return `位置 ${machineId}${positionIndex || ''}`
+}
+
+function markOnlinePlayerAsSelf(registration = null, allowReplacementPrompt = true) {
+  const profile = onlineJoinProfile.value
+  const targetQueueId = onlineJoinQueueId.value || queueId.value
+  if (!profile || !targetQueueId) return false
+  const registrationId = registration?.registration_id ?? registration?.registrationId ?? ''
+  const playerIdentity = {
+    queueId: targetQueueId,
+    registrationId,
+    registrationIds: [registrationId].filter(Boolean),
+    displayId: profile.nickname,
+    qqNumber: profile.qqNumber,
+    markedAt: Date.now()
+  }
+  const continuesExistingMark = !markedSelf.value || isSameMarkedPlayer(
+    markedSelf.value,
+    playerIdentity
+  )
+  if (!continuesExistingMark) {
+    if (allowReplacementPrompt) pendingSelfRegistration.value = playerIdentity
+    return false
+  }
+  persistMarkedSelf({
+    ...playerIdentity,
+    registrationIds: [registrationId, ...knownSelfRegistrationIds()].filter(Boolean)
+  })
+  return true
+}
+
+function scheduleOnlineCommandPoll() {
+  if (!onlineJoinCommandId.value) return
+  if (onlineCommandTimer) window.clearTimeout(onlineCommandTimer)
+  onlineCommandTimer = window.setTimeout(pollOnlineJoinCommand, ONLINE_COMMAND_POLL_INTERVAL)
+}
+
+async function pollOnlineJoinCommand() {
+  const commandId = onlineJoinCommandId.value
+  if (!commandId) return
+  try {
+    const response = await fetch(`${QUEUE_ONLINE_COMMAND_API_BASE}/${encodeURIComponent(commandId)}`, {
+      cache: 'no-store',
+      headers: { Accept: 'application/json' }
+    })
+    const command = await readJsonResponse(response)
+    if (commandId !== onlineJoinCommandId.value) return
+    if (command.status === 'PENDING') {
+      scheduleOnlineCommandPoll()
+      return
+    }
+    if (command.status === 'APPLIED') {
+      onlineJoinResultDetail.value = command.result_detail || '线上登记已经加入等待顺序。'
+      onlineJoinStep.value = 'SUCCESS'
+      markOnlinePlayerAsSelf(null, false)
+      await loadQueue(true)
+      return
+    }
+    onlineJoinResultDetail.value = command.result_detail || '现场终端没有执行这次线上登记。'
+    onlineJoinCommandId.value = null
+    onlineJoinStep.value = 'REJECTED'
+  } catch {
+    scheduleOnlineCommandPoll()
+  }
+}
+
+async function submitOnlineJoin() {
+  const profile = onlineJoinProfile.value
+  const machine = selectedOnlineJoinMachine.value
+  if (!profile || !machine?.available) {
+    onlineJoinError.value = '所选机台当前不能接收新的登记，请重新查询。'
+    return
+  }
+  const preference = onlineJoinNeedsPreference.value
+    ? onlineJoinPreference.value
+    : profile.defaultPreference
+  if (!['SOLO', 'OPEN_TO_JOIN'].includes(preference)) {
+    onlineJoinError.value = '请选择本次游玩偏好。'
+    return
+  }
+  const requestId = onlineJoinCommandId.value || createRequestId()
+  onlineJoinCommandId.value = requestId
+  onlineJoinLoading.value = true
+  onlineJoinError.value = ''
+  try {
+    const response = await fetch(QUEUE_ONLINE_JOIN_API_URL, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        request_id: requestId,
+        qq: profile.qqNumber,
+        machine_id: machine.id,
+        preference
+      })
+    })
+    const command = await readJsonResponse(response)
+    onlineJoinCommandId.value = command.command_id || requestId
+    onlineJoinStep.value = 'PENDING'
+    if (command.status === 'APPLIED' || command.status === 'REJECTED') {
+      await pollOnlineJoinCommand()
+    } else {
+      scheduleOnlineCommandPoll()
+    }
+  } catch (error) {
+    onlineJoinError.value = error?.message || '线上登记暂时无法提交，请稍后重试。'
+  } finally {
+    onlineJoinLoading.value = false
+  }
+}
+
 function handleKeydown(event) {
   if (event.key !== 'Escape') return
-  if (pendingSelfRegistration.value) pendingSelfRegistration.value = null
+  if (onlineJoinVisible.value) closeOnlineJoin()
+  else if (pendingSelfRegistration.value) pendingSelfRegistration.value = null
   else closeDetail()
 }
 
@@ -970,6 +1356,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (refreshTimer) window.clearInterval(refreshTimer)
   if (clockTimer) window.clearInterval(clockTimer)
+  if (onlineCommandTimer) window.clearTimeout(onlineCommandTimer)
   window.removeEventListener('keydown', handleKeydown)
 })
 </script>
@@ -1045,6 +1432,18 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <button class="queue-self-clear" type="button" @click="clearMarkedSelf">取消标记</button>
+    </section>
+
+    <section v-if="hasSnapshot && activeView === 'queue'" class="queue-online-entry"
+      :class="{ 'is-disabled': !onlineRegistrationAvailable }">
+      <span class="queue-online-entry-icon" aria-hidden="true"><UserPlus :size="20" /></span>
+      <div>
+        <strong>线上登记</strong>
+        <span>{{ onlineRegistrationSummary }}</span>
+      </div>
+      <button type="button" :disabled="!onlineRegistrationAvailable" @click="openOnlineJoin">
+        加入排队
+      </button>
     </section>
 
     <section v-if="!hasSnapshot" class="queue-unavailable" aria-live="polite">
@@ -1253,6 +1652,160 @@ onBeforeUnmount(() => {
 
     <Teleport to="body">
       <Transition name="queue-dialog">
+        <div v-if="onlineJoinVisible" class="queue-detail-backdrop" @click.self="closeOnlineJoin">
+          <section class="queue-detail-dialog queue-online-dialog" role="dialog" aria-modal="true"
+            aria-label="加入排队">
+            <header class="queue-detail-header">
+              <div>
+                <h2>{{ onlineJoinStep === 'LOOKUP' ? '加入排队'
+                  : onlineJoinStep === 'CONFIRM' ? '确认登记信息'
+                    : onlineJoinStep === 'EXISTING' ? '你已在排队'
+                      : onlineJoinStep === 'PENDING' ? '正在提交登记'
+                        : onlineJoinStep === 'REJECTED' ? '登记没有执行'
+                          : '线上登记已完成' }}</h2>
+                <p v-if="onlineJoinStep === 'LOOKUP'">使用已在现场终端建立的玩家资料</p>
+                <p v-else-if="onlineJoinStep === 'CONFIRM'">核对资料，并确认本次排队安排</p>
+                <p v-else-if="onlineJoinStep === 'PENDING'">正在等待现场终端处理</p>
+              </div>
+              <button type="button" aria-label="关闭加入排队" title="关闭" @click="closeOnlineJoin">
+                <X :size="20" aria-hidden="true" />
+              </button>
+            </header>
+
+            <form v-if="onlineJoinStep === 'LOOKUP'" class="queue-online-form" @submit.prevent="queryOnlineProfile">
+              <label class="queue-online-field">
+                <span>QQ 号</span>
+                <input :value="onlineJoinQq" inputmode="numeric" autocomplete="off" maxlength="12"
+                  placeholder="输入玩家资料绑定的 QQ 号" @input="handleOnlineJoinQqInput" />
+              </label>
+              <fieldset class="queue-online-options">
+                <legend>选择机台</legend>
+                <div class="queue-online-machine-options">
+                  <button v-for="machine in onlineJoinMachineOptions" :key="machine.id" type="button"
+                    :class="{ active: onlineJoinMachineId === machine.id }" :disabled="!machine.available"
+                    @click="selectOnlineJoinMachine(machine)">
+                    <strong>{{ machine.name }}</strong>
+                    <span>{{ onlineMachineEstimateText(machine) }}</span>
+                  </button>
+                </div>
+              </fieldset>
+              <p v-if="onlineJoinError" class="queue-online-error" role="alert">{{ onlineJoinError }}</p>
+              <button class="queue-online-primary" type="submit" :disabled="onlineJoinLoading">
+                {{ onlineJoinLoading ? '正在查询' : '查询玩家资料' }}
+              </button>
+              <p class="queue-online-hint">没有找到资料时，请先在现场终端的玩家资料库中创建并绑定 QQ。</p>
+            </form>
+
+            <div v-else-if="onlineJoinStep === 'CONFIRM'" class="queue-online-form">
+              <dl class="queue-online-profile">
+                <div>
+                  <dt>玩家昵称</dt>
+                  <dd>{{ onlineJoinProfile.nickname }}</dd>
+                </div>
+                <div>
+                  <dt>性别</dt>
+                  <dd class="queue-online-gender" :class="`is-${onlineJoinProfile.gender.toLowerCase()}`">
+                    <span aria-hidden="true">{{ playerGenderText(onlineJoinProfile.gender) }}</span>
+                    {{ playerGenderLabel(onlineJoinProfile.gender) }}
+                  </dd>
+                </div>
+                <div>
+                  <dt>QQ</dt>
+                  <dd>{{ onlineJoinProfile.qqNumber }}</dd>
+                </div>
+                <div>
+                  <dt>默认游玩偏好</dt>
+                  <dd>{{ profilePreferenceText(onlineJoinProfile.defaultPreference) }}</dd>
+                </div>
+              </dl>
+
+              <fieldset class="queue-online-options">
+                <legend>排队机台</legend>
+                <div class="queue-online-machine-options">
+                  <button v-for="machine in onlineJoinMachineOptions" :key="machine.id" type="button"
+                    :class="{ active: onlineJoinMachineId === machine.id }" :disabled="!machine.available"
+                    @click="selectOnlineJoinMachine(machine)">
+                    <strong>{{ machine.name }}</strong>
+                    <span>{{ onlineMachineEstimateText(machine) }}</span>
+                  </button>
+                </div>
+              </fieldset>
+
+              <fieldset v-if="onlineJoinNeedsPreference" class="queue-online-options">
+                <legend>本次游玩偏好</legend>
+                <div class="queue-online-preference-options">
+                  <button type="button" :class="{ active: onlineJoinPreference === 'OPEN_TO_JOIN' }"
+                    @click="selectOnlineJoinPreference('OPEN_TO_JOIN')">
+                    <strong>允许他人加入</strong>
+                    <span>接受分配的共同游玩通常可以减少等待时间</span>
+                  </button>
+                  <button type="button" :class="{ active: onlineJoinPreference === 'SOLO' }"
+                    @click="selectOnlineJoinPreference('SOLO')">
+                    <strong>单人游玩</strong>
+                    <span>独自占用一个等待位置</span>
+                  </button>
+                </div>
+              </fieldset>
+
+              <div class="queue-online-check-in-notice">
+                <TriangleAlert :size="18" aria-hidden="true" />
+                <p><strong>到场后需要签到</strong><span>登记加入后会显示为“线上登记 · 待签到”。请在现场终端点击自己的登记并选择“已到场”；签到前不会进入游玩位置。</span></p>
+              </div>
+              <p v-if="onlineJoinError" class="queue-online-error" role="alert">{{ onlineJoinError }}</p>
+              <div class="queue-online-actions">
+                <button type="button" @click="backToOnlineLookup">返回查询</button>
+                <button class="primary" type="button" :disabled="onlineJoinLoading || !selectedOnlineJoinMachine?.available"
+                  @click="submitOnlineJoin">
+                  {{ onlineJoinLoading ? '正在提交' : '完成并加入排队' }}
+                </button>
+              </div>
+            </div>
+
+            <div v-else-if="onlineJoinStep === 'EXISTING'" class="queue-online-result">
+              <span class="queue-online-result-icon is-information" aria-hidden="true">
+                <UserRoundCheck :size="23" />
+              </span>
+              <strong>“{{ onlineJoinProfile.nickname }}”已有一份登记</strong>
+              <p>当前位于{{ existingOnlineRegistrationText() }}。{{ onlineJoinExistingRegistration.online_registration_pending_check_in
+                ? '这份线上登记仍需到现场终端完成签到。'
+                : '不能重复加入排队。' }}</p>
+              <button class="queue-online-primary" type="button"
+                @click="markOnlinePlayerAsSelf(onlineJoinExistingRegistration); closeOnlineJoin()">
+                查看我的排队
+              </button>
+            </div>
+
+            <div v-else-if="onlineJoinStep === 'PENDING'" class="queue-online-result" aria-live="polite">
+              <span class="queue-online-result-icon" aria-hidden="true">
+                <RefreshCw :size="23" class="spinning" />
+              </span>
+              <strong>正在等待现场终端确认</strong>
+              <p>请保持页面打开。终端处理完成后，这里会显示最终结果；重复点击不会建立多份登记。</p>
+              <button class="queue-online-secondary" type="button" @click="closeOnlineJoin">在后台等待</button>
+            </div>
+
+            <div v-else-if="onlineJoinStep === 'REJECTED'" class="queue-online-result is-rejected" aria-live="polite">
+              <span class="queue-online-result-icon" aria-hidden="true"><TriangleAlert :size="23" /></span>
+              <strong>这次线上登记没有执行</strong>
+              <p>{{ onlineJoinResultDetail }}</p>
+              <button class="queue-online-primary" type="button" @click="backToOnlineLookup">重新查询</button>
+            </div>
+
+            <div v-else class="queue-online-result is-success" aria-live="polite">
+              <span class="queue-online-result-icon" aria-hidden="true"><CircleCheck :size="24" /></span>
+              <strong>已加入等待顺序</strong>
+              <p>{{ onlineJoinResultDetail }}</p>
+              <div class="queue-online-check-in-notice">
+                <TriangleAlert :size="18" aria-hidden="true" />
+                <p><strong>请在到场后完成签到</strong><span>在现场终端点击自己的登记并选择“已到场”。完成签到前，这份登记不会进入游玩位置。</span></p>
+              </div>
+              <button class="queue-online-primary" type="button" @click="closeOnlineJoin">查看队列</button>
+            </div>
+          </section>
+        </div>
+      </Transition>
+
+      <Transition name="queue-dialog">
         <div v-if="selectedDetail" class="queue-detail-backdrop" @click.self="closeDetail">
           <section class="queue-detail-dialog" role="dialog" aria-modal="true" :aria-label="selectedDetail.title">
             <header class="queue-detail-header">
@@ -1278,6 +1831,7 @@ onBeforeUnmount(() => {
                 <span v-if="selectedDetail.registrations.some((registration) => registration.temporarilyAway)" class="is-absence">包含暂时离开</span>
                 <span v-if="selectedDetail.registrations.some((registration) => registration.deferredOnce)" class="is-absence">包含暂缓一轮</span>
                 <span v-if="selectedDetail.registrations.some((registration) => registration.noShowCount > 0)" class="is-warning">包含未到场记录</span>
+                <span v-if="selectedDetail.registrations.some((registration) => registration.onlineRegistrationPendingCheckIn)" class="is-online">包含待签到登记</span>
               </div>
               <div class="queue-detail-registration-list">
                 <button v-for="registration in selectedDetail.registrations"
@@ -1296,6 +1850,9 @@ onBeforeUnmount(() => {
 
             <template v-else>
               <div class="queue-detail-pills">
+                <span v-if="selectedDetail.registration.onlineRegistrationPendingCheckIn" class="is-online">
+                  线上登记 · 待签到
+                </span>
                 <span :class="{ 'is-absence': absenceLabel(selectedDetail.registration) }">
                   {{ absenceLabel(selectedDetail.registration) || preferenceLabel(selectedDetail.registration) }}
                 </span>
@@ -1313,7 +1870,11 @@ onBeforeUnmount(() => {
                   <dt>当前状态</dt>
                   <dd>{{ absenceLabel(selectedDetail.registration) }}</dd>
                 </div>
-                <div v-if="selectedDetail.estimatedWaitMinutes !== null">
+                <div v-if="selectedDetail.registration.onlineRegistrationPendingCheckIn">
+                  <dt>当前状态</dt>
+                  <dd>等待现场签到</dd>
+                </div>
+                <div v-if="selectedDetail.estimatedWaitMinutes !== null || selectedDetail.registration.onlineRegistrationPendingCheckIn">
                   <dt>预计游玩</dt>
                   <dd>{{ positionEstimateText(selectedDetail.estimatedWaitMinutes, selectedDetail.locationRegistrations, selectedDetail.machine) }}</dd>
                 </div>
@@ -1395,6 +1956,8 @@ onBeforeUnmount(() => {
   --queue-soft-orange: #fff1dc;
   --queue-red: #c9342c;
   --queue-soft-red: #ffefee;
+  --queue-online: #087f73;
+  --queue-soft-online: #e8f7f4;
   --queue-disabled: #e8e8ed;
   width: 100%;
   max-width: 1040px;
@@ -1419,6 +1982,8 @@ onBeforeUnmount(() => {
   --queue-soft-orange: #3b2b13;
   --queue-red: #ff6961;
   --queue-soft-red: #3b1716;
+  --queue-online: #63d8ca;
+  --queue-soft-online: #143632;
   --queue-disabled: #2c2c2e;
 }
 
@@ -1449,10 +2014,12 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-self { display: grid; margin: 0 0 18px; padding: 17px 18px; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: start; gap: 13px; border: 1px solid color-mix(in srgb, var(--queue-blue) 28%, var(--queue-separator)); border-radius: 14px; background: color-mix(in srgb, var(--queue-soft-blue) 72%, var(--queue-card)); }
 .queue-self.is-warning { border-color: color-mix(in srgb, #ff9500 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-orange) 74%, var(--queue-card)); }
 .queue-self.is-danger { border-color: color-mix(in srgb, var(--queue-red) 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-red) 76%, var(--queue-card)); }
+.queue-self.is-online { border-color: color-mix(in srgb, var(--queue-online) 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-online) 78%, var(--queue-card)); }
 .queue-self.is-muted { border-color: var(--queue-separator); background: var(--queue-card); }
 .queue-self-icon { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 50%; color: var(--queue-blue); background: var(--queue-card); }
 .queue-self.is-warning .queue-self-icon { color: var(--queue-orange); }
 .queue-self.is-danger .queue-self-icon { color: var(--queue-red); }
+.queue-self.is-online .queue-self-icon { color: var(--queue-online); }
 .queue-self-main { min-width: 0; }
 .queue-self-eyebrow { color: var(--queue-secondary); font-size: 10px; font-weight: 600; }
 .queue-self h2 { margin: 1px 0 0; border: 0; font-size: 19px; font-weight: 650; line-height: 1.3; letter-spacing: 0; overflow-wrap: anywhere; }
@@ -1461,6 +2028,17 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-self-facts { display: flex; margin-top: 9px; flex-wrap: wrap; gap: 6px; }
 .queue-self-facts span { display: flex; padding: 4px 7px; align-items: center; gap: 4px; border-radius: 6px; color: var(--queue-secondary); background: color-mix(in srgb, var(--queue-card) 82%, transparent); font-size: 10px; }
 .queue-self-clear { padding: 7px 8px; border: 0; color: var(--queue-secondary); background: transparent; cursor: pointer; font-size: 11px; }
+
+.queue-online-entry { display: grid; min-height: 66px; margin: 0 0 16px; padding: 11px 12px; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 11px; border: 1px solid color-mix(in srgb, var(--queue-online) 24%, var(--queue-separator)); border-radius: 11px; background: color-mix(in srgb, var(--queue-soft-online) 48%, var(--queue-card)); }
+.queue-online-entry.is-disabled { border-color: var(--queue-separator); background: var(--queue-card); }
+.queue-online-entry-icon { display: grid; width: 36px; height: 36px; place-items: center; border-radius: 50%; color: var(--queue-online); background: var(--queue-card); }
+.queue-online-entry.is-disabled .queue-online-entry-icon { color: var(--queue-tertiary); background: var(--queue-position); }
+.queue-online-entry > div { min-width: 0; }
+.queue-online-entry strong, .queue-online-entry span { display: block; }
+.queue-online-entry > div > strong { font-size: 13px; font-weight: 620; line-height: 1.4; }
+.queue-online-entry > div > span { margin-top: 2px; color: var(--queue-secondary); font-size: 10px; line-height: 1.45; }
+.queue-online-entry > button { min-height: 36px; padding: 0 13px; border: 0; border-radius: 8px; color: #fff; background: var(--queue-blue); cursor: pointer; font-size: 11px; font-weight: 600; }
+.queue-online-entry > button:disabled { color: var(--queue-tertiary); background: var(--queue-disabled); cursor: default; }
 
 .queue-unavailable { display: flex; min-height: 184px; padding: 28px 22px; align-items: center; gap: 15px; border: 1px solid var(--queue-separator); border-radius: 14px; background: var(--queue-card); }
 .queue-unavailable-icon { display: grid; width: 44px; height: 44px; flex: 0 0 auto; place-items: center; border-radius: 50%; color: var(--queue-secondary); background: var(--queue-position); }
@@ -1507,6 +2085,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-position.is-playing .queue-registration { border-color: color-mix(in srgb, var(--queue-blue) 8%, transparent); background: color-mix(in srgb, var(--queue-card) 90%, var(--queue-soft-blue)); }
 .queue-registration.is-absence { background: color-mix(in srgb, var(--queue-soft-orange) 72%, var(--queue-card)); }
 .queue-registration.is-warning { border-color: color-mix(in srgb, var(--queue-red) 22%, transparent); background: color-mix(in srgb, var(--queue-soft-red) 72%, var(--queue-card)); }
+.queue-registration.is-online { border-color: color-mix(in srgb, var(--queue-online) 22%, transparent); background: color-mix(in srgb, var(--queue-soft-online) 76%, var(--queue-card)); }
 .queue-registration.is-self { border-color: color-mix(in srgb, var(--queue-blue) 54%, var(--queue-separator)); }
 .queue-registration > svg { position: absolute; top: 50%; right: 8px; color: var(--queue-tertiary); transform: translateY(-50%); }
 .queue-registration.is-self > svg { color: var(--queue-blue); }
@@ -1514,6 +2093,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-registration span { margin-top: 4px; color: var(--queue-secondary); font-size: 10px; line-height: 1.35; }
 .queue-registration.is-absence span { color: var(--queue-orange); font-weight: 570; }
 .queue-registration.is-warning span { color: var(--queue-red); font-weight: 570; }
+.queue-registration.is-online span { color: var(--queue-online); font-weight: 570; }
 .queue-overtime { display: flex; padding: 10px; justify-content: center; flex-direction: column; color: var(--queue-orange); background: var(--queue-soft-orange); }
 .queue-overtime strong { font-size: 11px; line-height: 1.4; }
 .queue-overtime span { margin-top: 4px; font-size: 9px; line-height: 1.45; }
@@ -1546,8 +2126,8 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-load-more { display: block; margin: 14px auto 0; }
 
 .queue-detail-backdrop { position: fixed; z-index: 10000; inset: 0; display: grid; padding: 18px; place-items: center; background: rgba(0, 0, 0, .42); }
-.queue-detail-dialog, .queue-confirm-dialog { --queue-card: #fff; --queue-position: #f5f5f7; --queue-text: #1d1d1f; --queue-secondary: #6e6e73; --queue-tertiary: #8e8e93; --queue-separator: #d2d2d7; --queue-blue: #007aff; --queue-soft-blue: #eaf3ff; --queue-orange: #b85c00; --queue-soft-orange: #fff1dc; width: min(100%, 480px); max-height: min(680px, calc(100vh - 36px)); padding: 20px; overflow-y: auto; border: 1px solid var(--queue-separator); border-radius: 16px; color: var(--queue-text); background: var(--queue-card); box-shadow: 0 20px 54px rgba(0, 0, 0, .22); }
-:global(html.dark) .queue-detail-dialog, :global(html.dark) .queue-confirm-dialog { --queue-card: #1c1c1e; --queue-position: #242426; --queue-text: #f5f5f7; --queue-secondary: #a1a1a6; --queue-tertiary: #8e8e93; --queue-separator: #38383a; --queue-blue: #0a84ff; --queue-soft-blue: #142b44; --queue-orange: #ffb35c; --queue-soft-orange: #3b2b13; }
+.queue-detail-dialog, .queue-confirm-dialog { --queue-card: #fff; --queue-position: #f5f5f7; --queue-text: #1d1d1f; --queue-secondary: #6e6e73; --queue-tertiary: #8e8e93; --queue-separator: #d2d2d7; --queue-blue: #007aff; --queue-soft-blue: #eaf3ff; --queue-orange: #b85c00; --queue-soft-orange: #fff1dc; --queue-online: #087f73; --queue-soft-online: #e8f7f4; width: min(100%, 480px); max-height: min(680px, calc(100vh - 36px)); padding: 20px; overflow-y: auto; border: 1px solid var(--queue-separator); border-radius: 16px; color: var(--queue-text); background: var(--queue-card); box-shadow: 0 20px 54px rgba(0, 0, 0, .22); }
+:global(html.dark) .queue-detail-dialog, :global(html.dark) .queue-confirm-dialog { --queue-card: #1c1c1e; --queue-position: #242426; --queue-text: #f5f5f7; --queue-secondary: #a1a1a6; --queue-tertiary: #8e8e93; --queue-separator: #38383a; --queue-blue: #0a84ff; --queue-soft-blue: #142b44; --queue-orange: #ffb35c; --queue-soft-orange: #3b2b13; --queue-online: #63d8ca; --queue-soft-online: #143632; }
 .queue-detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .queue-detail-header > div { min-width: 0; }
 .queue-detail-header h2, .queue-confirm-dialog h2 { margin: 0; border: 0; overflow-wrap: anywhere; font-size: 22px; font-weight: 640; line-height: 1.3; letter-spacing: 0; }
@@ -1557,16 +2137,19 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-detail-pills span { padding: 5px 8px; border-radius: 6px; color: var(--queue-secondary); background: var(--queue-position); font-size: 10px; line-height: 1.35; }
 .queue-detail-pills span.is-absence { color: var(--queue-orange); background: var(--queue-soft-orange); }
 .queue-detail-pills span.is-warning { color: var(--queue-red); background: var(--queue-soft-red); }
+.queue-detail-pills span.is-online { color: var(--queue-online); background: var(--queue-soft-online); }
 .queue-detail-registration-list { display: grid; margin-top: 16px; gap: 8px; }
 .queue-detail-registration-list button { display: flex; min-width: 0; min-height: 54px; padding: 10px 12px; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--queue-separator); border-radius: 9px; color: var(--queue-text); background: var(--queue-position); text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .12s ease; }
 .queue-detail-registration-list button:active { transform: scale(.99); }
 .queue-detail-registration-list button.is-absence { border-color: color-mix(in srgb, var(--queue-orange) 18%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-orange) 72%, var(--queue-position)); }
 .queue-detail-registration-list button.is-warning { border-color: color-mix(in srgb, var(--queue-red) 18%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-red) 72%, var(--queue-position)); }
+.queue-detail-registration-list button.is-online { border-color: color-mix(in srgb, var(--queue-online) 20%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-online) 76%, var(--queue-position)); }
 .queue-detail-registration-list button > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
 .queue-detail-registration-list strong { overflow-wrap: anywhere; font-size: 13px; font-weight: 580; }
 .queue-detail-registration-list small { color: var(--queue-secondary); font-size: 10px; }
 .queue-detail-registration-list button.is-absence small { color: var(--queue-orange); }
 .queue-detail-registration-list button.is-warning small { color: var(--queue-red); }
+.queue-detail-registration-list button.is-online small { color: var(--queue-online); }
 .queue-detail-registration-list svg { flex: 0 0 auto; color: var(--queue-tertiary); }
 .queue-detail-metadata { margin: 18px 0 0; border-top: 1px solid var(--queue-separator); }
 .queue-detail-metadata > div { display: grid; min-height: 44px; padding: 9px 0; grid-template-columns: minmax(82px, auto) minmax(0, 1fr); align-items: center; gap: 16px; border-bottom: 1px solid var(--queue-separator); }
@@ -1578,6 +2161,59 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-detail-primary { color: #fff; background: var(--queue-blue); }
 .queue-detail-secondary { color: var(--queue-text); background: var(--queue-position); }
 .queue-detail-privacy { max-width: 34em; margin: 8px auto 0; color: var(--queue-tertiary); font-size: 10px; line-height: 1.5; text-align: center; text-wrap: balance; }
+
+.queue-online-dialog { width: min(100%, 520px); }
+.queue-online-form { display: grid; margin-top: 18px; gap: 16px; }
+.queue-online-field { display: grid; gap: 7px; }
+.queue-online-field > span, .queue-online-options legend { color: var(--queue-secondary); font-size: 11px; font-weight: 580; line-height: 1.4; }
+.queue-online-field input { width: 100%; height: 46px; padding: 0 13px; border: 1px solid var(--queue-separator); border-radius: 9px; outline: 0; color: var(--queue-text); background: var(--queue-position); font: inherit; font-size: 13px; letter-spacing: 0; transition: border-color .16s ease, box-shadow .16s ease, background .16s ease; }
+.queue-online-field input:focus { border-color: var(--queue-blue); background: var(--queue-card); box-shadow: 0 0 0 3px color-mix(in srgb, var(--queue-blue) 14%, transparent); }
+.queue-online-field input::placeholder { color: var(--queue-tertiary); }
+.queue-online-options { min-width: 0; margin: 0; padding: 0; border: 0; }
+.queue-online-options legend { margin-bottom: 7px; padding: 0; }
+.queue-online-machine-options, .queue-online-preference-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.queue-online-machine-options button, .queue-online-preference-options button { display: flex; min-width: 0; min-height: 62px; padding: 10px 11px; justify-content: center; flex-direction: column; border: 1px solid var(--queue-separator); border-radius: 9px; color: var(--queue-text); background: var(--queue-position); text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .12s ease; }
+.queue-online-machine-options button:active:not(:disabled), .queue-online-preference-options button:active { transform: scale(.99); }
+.queue-online-machine-options button.active, .queue-online-preference-options button.active { border-color: color-mix(in srgb, var(--queue-blue) 62%, var(--queue-separator)); background: var(--queue-soft-blue); }
+.queue-online-machine-options button:disabled { color: var(--queue-tertiary); background: var(--queue-disabled); cursor: default; }
+.queue-online-machine-options strong, .queue-online-machine-options span, .queue-online-preference-options strong, .queue-online-preference-options span { display: block; }
+.queue-online-machine-options strong, .queue-online-preference-options strong { font-size: 12px; font-weight: 610; line-height: 1.4; }
+.queue-online-machine-options span, .queue-online-preference-options span { margin-top: 4px; color: var(--queue-secondary); font-size: 9px; line-height: 1.45; }
+.queue-online-machine-options button:disabled span { color: var(--queue-tertiary); }
+.queue-online-profile { margin: 0; border-top: 1px solid var(--queue-separator); }
+.queue-online-profile > div { display: grid; min-height: 42px; padding: 8px 0; grid-template-columns: minmax(92px, auto) minmax(0, 1fr); align-items: center; gap: 14px; border-bottom: 1px solid var(--queue-separator); }
+.queue-online-profile dt, .queue-online-profile dd { margin: 0; font-size: 11px; line-height: 1.5; }
+.queue-online-profile dt { color: var(--queue-tertiary); }
+.queue-online-profile dd { overflow-wrap: anywhere; text-align: right; }
+.queue-online-gender { display: flex; align-items: center; justify-content: flex-end; gap: 5px; }
+.queue-online-gender > span { color: var(--queue-tertiary); font-size: 15px; font-weight: 650; }
+.queue-online-gender.is-male > span { color: #1677d2; }
+.queue-online-gender.is-female > span { color: #d7558b; }
+.queue-online-check-in-notice { display: flex; padding: 11px 12px; align-items: flex-start; gap: 9px; border-left: 3px solid var(--queue-online); color: var(--queue-online); background: var(--queue-soft-online); }
+.queue-online-check-in-notice > svg { margin-top: 1px; flex: 0 0 auto; }
+.queue-online-check-in-notice p { margin: 0; }
+.queue-online-check-in-notice strong, .queue-online-check-in-notice span { display: block; }
+.queue-online-check-in-notice strong { font-size: 11px; font-weight: 640; line-height: 1.45; }
+.queue-online-check-in-notice span { margin-top: 2px; color: var(--queue-secondary); font-size: 10px; line-height: 1.55; }
+.queue-online-error { margin: -4px 0 0; padding: 9px 10px; border-radius: 7px; color: var(--queue-red); background: var(--queue-soft-red); font-size: 10px; line-height: 1.5; }
+.queue-online-primary, .queue-online-secondary { display: flex; width: 100%; min-height: 44px; padding: 0 14px; align-items: center; justify-content: center; border: 0; border-radius: 9px; cursor: pointer; font-size: 12px; font-weight: 600; }
+.queue-online-primary { color: #fff; background: var(--queue-blue); }
+.queue-online-secondary { color: var(--queue-text); background: var(--queue-position); }
+.queue-online-primary:disabled { color: var(--queue-tertiary); background: var(--queue-disabled); cursor: default; }
+.queue-online-hint { max-width: 38em; margin: -8px auto 0; color: var(--queue-tertiary); font-size: 9px; line-height: 1.5; text-align: center; }
+.queue-online-actions { display: grid; grid-template-columns: 1fr 1.35fr; gap: 8px; }
+.queue-online-actions button { min-height: 44px; border: 0; border-radius: 9px; color: var(--queue-text); background: var(--queue-position); cursor: pointer; font-size: 11px; font-weight: 590; }
+.queue-online-actions button.primary { color: #fff; background: var(--queue-blue); }
+.queue-online-actions button:disabled { color: var(--queue-tertiary); background: var(--queue-disabled); cursor: default; }
+.queue-online-result { display: flex; min-height: 250px; padding: 24px 4px 4px; align-items: center; justify-content: center; flex-direction: column; text-align: center; }
+.queue-online-result-icon { display: grid; width: 48px; height: 48px; place-items: center; border-radius: 50%; color: var(--queue-blue); background: var(--queue-soft-blue); }
+.queue-online-result-icon.is-information { color: var(--queue-online); background: var(--queue-soft-online); }
+.queue-online-result.is-success .queue-online-result-icon { color: #248a3d; background: color-mix(in srgb, #34c759 12%, var(--queue-card)); }
+.queue-online-result.is-rejected .queue-online-result-icon { color: var(--queue-red); background: var(--queue-soft-red); }
+.queue-online-result > strong { margin-top: 14px; font-size: 16px; font-weight: 640; line-height: 1.4; }
+.queue-online-result > p { max-width: 38em; margin: 6px 0 0; color: var(--queue-secondary); font-size: 11px; line-height: 1.65; }
+.queue-online-result > .queue-online-check-in-notice { width: 100%; margin-top: 16px; text-align: left; }
+.queue-online-result > .queue-online-primary, .queue-online-result > .queue-online-secondary { margin-top: 18px; }
 .queue-confirm-dialog { width: min(100%, 420px); }
 .queue-confirm-dialog p { margin: 8px 0 0; color: var(--queue-secondary); font-size: 12px; line-height: 1.65; }
 .queue-confirm-dialog > div { display: grid; margin-top: 18px; grid-template-columns: 1fr 1fr; gap: 8px; }

@@ -17,13 +17,13 @@ import MobileRegistrationFlow from './MobileRegistrationFlow.vue'
 
 const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL || 'https://abcccc.top/api/queue-status'
 const QUEUE_LOG_API_URL = import.meta.env.VITE_QUEUE_LOG_API_URL ||
-  QUEUE_API_URL.replace(/queue-status(?:\?.*)?$/, 'queue-logs')
+  QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'queue-logs')
 const QUEUE_ONLINE_PROFILE_API_URL = import.meta.env.VITE_QUEUE_ONLINE_PROFILE_API_URL ||
-  QUEUE_API_URL.replace(/queue-status(?:\?.*)?$/, 'queue-online/profile')
+  QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'queue-online/profile')
 const QUEUE_ONLINE_JOIN_API_URL = import.meta.env.VITE_QUEUE_ONLINE_JOIN_API_URL ||
-  QUEUE_API_URL.replace(/queue-status(?:\?.*)?$/, 'queue-online/join')
+  QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'queue-online/join')
 const QUEUE_ONLINE_COMMAND_API_BASE = import.meta.env.VITE_QUEUE_ONLINE_COMMAND_API_BASE ||
-  QUEUE_API_URL.replace(/queue-status(?:\?.*)?$/, 'queue-online/commands')
+  QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'queue-online/commands')
 const REFRESH_INTERVAL = 10000
 const ONLINE_COMMAND_POLL_INTERVAL = 1500
 const SELF_STORAGE_KEY = 'maimai-q:marked-registration:v1'
@@ -1086,7 +1086,8 @@ function normalizeOnlineProfile(source) {
     nickname,
     qqNumber,
     gender: String(source.gender || 'UNDISCLOSED').toUpperCase(),
-    defaultPreference
+    defaultPreference,
+    setupComplete: Number(source.setup_version ?? source.setupVersion ?? 0) >= 1
   }
 }
 
@@ -1767,7 +1768,11 @@ onBeforeUnmount(() => {
 
               <div class="queue-online-check-in-notice">
                 <TriangleAlert :size="18" aria-hidden="true" />
-                <p><strong>须在 30 分钟内完成签到</strong><span>登记加入后会显示为“线上登记 · 待签到”。请到现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。</span></p>
+                <p>
+                  <strong>须在 30 分钟内完成签到</strong>
+                  <span>登记加入后会显示为“线上登记 · 待签到”。请到现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。</span>
+                  <span v-if="!onlineJoinProfile.setupComplete">这份玩家资料尚未补全通知偏好和 QQ 显示范围。线上登记可以先创建，但到场后须先在终端补全资料，才能签到。</span>
+                </p>
               </div>
               <p v-if="onlineJoinError" class="queue-online-error" role="alert">{{ onlineJoinError }}</p>
               <div class="queue-online-actions">
@@ -1787,6 +1792,7 @@ onBeforeUnmount(() => {
               <p>当前位于{{ existingOnlineRegistrationText() }}。{{ onlineJoinExistingRegistration.online_registration_pending_check_in
                 ? '这份线上登记仍需在创建后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。'
                 : '不能重复加入排队。' }}</p>
+              <p v-if="onlineJoinExistingRegistration.online_registration_pending_check_in && !onlineJoinProfile.setupComplete">这份玩家资料尚未补全。到场后须先在终端补全资料，才能签到。</p>
               <button class="queue-online-primary" type="button"
                 @click="markOnlinePlayerAsSelf(onlineJoinExistingRegistration); closeOnlineJoin()">
                 查看我的排队
@@ -1799,6 +1805,7 @@ onBeforeUnmount(() => {
               </span>
               <strong>正在等待现场终端确认</strong>
               <p>请保持页面打开。终端处理完成后，这里会显示最终结果；重复点击不会建立多份登记。</p>
+              <p v-if="!onlineJoinProfile?.setupComplete">终端确认创建后，到场时须先补全玩家资料，才能签到。</p>
               <button class="queue-online-secondary" type="button" @click="closeOnlineJoin">在后台等待</button>
             </div>
 
@@ -1815,7 +1822,11 @@ onBeforeUnmount(() => {
               <p>{{ onlineJoinResultDetail }}</p>
               <div class="queue-online-check-in-notice">
                 <TriangleAlert :size="18" aria-hidden="true" />
-                <p><strong>须在 30 分钟内完成签到</strong><span>在现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。</span></p>
+                <p>
+                  <strong>须在 30 分钟内完成签到</strong>
+                  <span>在现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。</span>
+                  <span v-if="!onlineJoinProfile?.setupComplete">到场后须先在终端补全玩家资料，才能签到。</span>
+                </p>
               </div>
               <button class="queue-online-primary" type="button" @click="closeOnlineJoin">查看队列</button>
             </div>

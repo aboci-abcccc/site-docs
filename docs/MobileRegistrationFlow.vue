@@ -21,7 +21,7 @@ const props = defineProps({
 const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL ||
   'https://abcccc.top/api/queue-status'
 const MOBILE_API_BASE = import.meta.env.VITE_QUEUE_MOBILE_API_BASE ||
-  QUEUE_API_URL.replace(/queue-status(?:\?.*)?$/, 'queue-mobile/sessions')
+  QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'queue-mobile/sessions')
 const PROFILE_COOKIE = 'maimai_q_mobile_profile'
 const RESULT_POLL_INTERVAL = 1500
 const DEFAULT_NOTIFICATIONS = Object.freeze({

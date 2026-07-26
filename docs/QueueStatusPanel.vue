@@ -13,6 +13,7 @@ import {
   X
 } from '@lucide/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import MobileRegistrationFlow from './MobileRegistrationFlow.vue'
 
 const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL || 'https://abcccc.top/api/queue-status'
 const QUEUE_LOG_API_URL = import.meta.env.VITE_QUEUE_LOG_API_URL ||
@@ -37,7 +38,8 @@ const logSourceDefinitions = [
   { value: 'ON_SITE_TERMINAL', label: '现场终端' },
   { value: 'QQ_BOT', label: 'QQ Bot' },
   { value: 'SYSTEM_AUTOMATIC', label: '系统自动' },
-  { value: 'WEBSITE_REMOTE', label: '网站远程' }
+  { value: 'WEBSITE_REMOTE', label: '网站远程' },
+  { value: 'MOBILE_DEVICE', label: '移动设备' }
 ]
 
 const machines = ref(machineDefinitions.map(createEmptyMachine))
@@ -87,6 +89,7 @@ const onlineJoinError = ref('')
 const onlineJoinCommandId = ref(null)
 const onlineJoinQueueId = ref(null)
 const onlineJoinResultDetail = ref('')
+const mobileRegistrationToken = ref('')
 let refreshTimer
 let clockTimer
 let onlineCommandTimer
@@ -1025,7 +1028,8 @@ function operationSourceLabel(source) {
     ON_SITE_TERMINAL: '现场终端',
     QQ_BOT: 'QQ Bot',
     SYSTEM_AUTOMATIC: '系统自动',
-    WEBSITE_REMOTE: '网站远程'
+    WEBSITE_REMOTE: '网站远程',
+    MOBILE_DEVICE: '移动设备'
   }[source] || '现场终端'
 }
 
@@ -1347,6 +1351,12 @@ function handleKeydown(event) {
 }
 
 onMounted(async () => {
+  mobileRegistrationToken.value = new URLSearchParams(window.location.search)
+    .get('mobile_registration') || ''
+  if (mobileRegistrationToken.value) {
+    await nextTick()
+    return
+  }
   restoreMarkedSelf()
   await loadQueue()
   refreshTimer = window.setInterval(() => loadQueue(true), REFRESH_INTERVAL)
@@ -1364,7 +1374,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="queue-panel">
+  <MobileRegistrationFlow v-if="mobileRegistrationToken" :token="mobileRegistrationToken" />
+  <main v-else class="queue-panel">
     <header class="queue-header">
       <div class="queue-heading">
         <h1>排队登记</h1>

@@ -52,6 +52,7 @@ const businessHours = ref({
 })
 const terminal = ref(null)
 const capabilities = ref({})
+const testData = ref(false)
 const capturedAt = ref(null)
 const queueId = ref(null)
 const hasSnapshot = ref(false)
@@ -117,7 +118,7 @@ const onlineRegistrationSummary = computed(() => {
   if (!machines.value.some((machine) => (
     machine.synced && machine.operational && machine.registrationCount < 20
   ))) return '当前没有可以接收新登记的机台'
-  return '使用现场玩家资料加入；到场后需要在终端完成签到'
+  return '使用现场玩家资料加入；创建登记后须在 30 分钟内到现场签到'
 })
 
 const onlineJoinMachineOptions = computed(() => {
@@ -452,6 +453,7 @@ function applyServerData(data) {
   businessHours.value = normalizeBusinessHours(data?.business_hours ?? data?.businessHours)
   terminal.value = data?.terminal ?? { online: true }
   capabilities.value = data?.capabilities || {}
+  testData.value = data?.test_data === true || data?.testData === true
   queueId.value = nextQueueId
   capturedAt.value = data?.received_at ?? data?.receivedAt ??
     data?.captured_at ?? data?.capturedAt ?? new Date().toISOString()
@@ -917,7 +919,7 @@ function markedSelfStatusTitle() {
   }
   const registration = location.registration
   if (!location.machine.operational) return `${location.machine.name} 已停止使用`
-  if (registration.onlineRegistrationPendingCheckIn) return '你还没有完成现场签到'
+  if (registration.onlineRegistrationPendingCheckIn) return '线上登记仍待现场签到'
   if (registration.temporarilyAway) return '你当前处于暂时离开状态'
   if (registration.deferredOnce) return '你已暂缓一轮'
   if (location.kind === 'PLAYING') return '现在轮到你游玩'
@@ -947,7 +949,7 @@ function markedSelfStatusDetail() {
     )}。登记顺序仍然保留，机台恢复正常使用后会重新开始本轮计时。`
   }
   if (registration.onlineRegistrationPendingCheckIn) {
-    return '这份线上登记已经保留在当前顺序。到达现场后，请在终端点击自己的登记并选择“已到场”；完成签到前不会进入游玩位置。'
+    return '请在创建登记后的 30 分钟内，到现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。'
   }
   if (registration.temporarilyAway) {
     const skipped = registration.temporaryAwaySkippedTurns
@@ -1408,6 +1410,11 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
+    <section v-if="hasSnapshot && testData" class="queue-test-notice" aria-live="polite">
+      <TriangleAlert :size="17" aria-hidden="true" />
+      <strong>当前数据是测试数据。</strong>
+    </section>
+
     <section v-if="markedSelf" class="queue-self" :class="`is-${markedSelfTone()}`" aria-live="polite">
       <div class="queue-self-icon" aria-hidden="true">
         <UserRoundCheck :size="22" />
@@ -1749,7 +1756,7 @@ onBeforeUnmount(() => {
 
               <div class="queue-online-check-in-notice">
                 <TriangleAlert :size="18" aria-hidden="true" />
-                <p><strong>到场后需要签到</strong><span>登记加入后会显示为“线上登记 · 待签到”。请在现场终端点击自己的登记并选择“已到场”；签到前不会进入游玩位置。</span></p>
+                <p><strong>须在 30 分钟内完成签到</strong><span>登记加入后会显示为“线上登记 · 待签到”。请到现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。</span></p>
               </div>
               <p v-if="onlineJoinError" class="queue-online-error" role="alert">{{ onlineJoinError }}</p>
               <div class="queue-online-actions">
@@ -1767,7 +1774,7 @@ onBeforeUnmount(() => {
               </span>
               <strong>“{{ onlineJoinProfile.nickname }}”已有一份登记</strong>
               <p>当前位于{{ existingOnlineRegistrationText() }}。{{ onlineJoinExistingRegistration.online_registration_pending_check_in
-                ? '这份线上登记仍需到现场终端完成签到。'
+                ? '这份线上登记仍需在创建后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。'
                 : '不能重复加入排队。' }}</p>
               <button class="queue-online-primary" type="button"
                 @click="markOnlinePlayerAsSelf(onlineJoinExistingRegistration); closeOnlineJoin()">
@@ -1797,7 +1804,7 @@ onBeforeUnmount(() => {
               <p>{{ onlineJoinResultDetail }}</p>
               <div class="queue-online-check-in-notice">
                 <TriangleAlert :size="18" aria-hidden="true" />
-                <p><strong>请在到场后完成签到</strong><span>在现场终端点击自己的登记并选择“已到场”。完成签到前，这份登记不会进入游玩位置。</span></p>
+                <p><strong>须在 30 分钟内完成签到</strong><span>在现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。</span></p>
               </div>
               <button class="queue-online-primary" type="button" @click="closeOnlineJoin">查看队列</button>
             </div>
@@ -1873,6 +1880,10 @@ onBeforeUnmount(() => {
                 <div v-if="selectedDetail.registration.onlineRegistrationPendingCheckIn">
                   <dt>当前状态</dt>
                   <dd>等待现场签到</dd>
+                </div>
+                <div v-if="selectedDetail.registration.onlineRegistrationPendingCheckIn">
+                  <dt>签到规则</dt>
+                  <dd>创建登记后 30 分钟内；轮到时仍未签到也会自动退出</dd>
                 </div>
                 <div v-if="selectedDetail.estimatedWaitMinutes !== null || selectedDetail.registration.onlineRegistrationPendingCheckIn">
                   <dt>预计游玩</dt>
@@ -2010,6 +2021,9 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-refresh:active:not(:disabled) { transform: scale(.95); }
 .queue-refresh:focus-visible, button:focus-visible, [role='button']:focus-visible { outline: 2px solid var(--queue-blue); outline-offset: 2px; }
 .spinning { animation: queue-spin .8s linear infinite; }
+.queue-test-notice { display: flex; margin: 0 0 16px; padding: 10px 12px; align-items: center; gap: 8px; border-left: 3px solid #ff9500; color: var(--queue-orange); background: color-mix(in srgb, var(--queue-soft-orange) 68%, var(--queue-card)); }
+.queue-test-notice svg { display: block; flex: 0 0 auto; }
+.queue-test-notice strong { font-size: 11px; font-weight: 620; line-height: 1.45; }
 
 .queue-self { display: grid; margin: 0 0 18px; padding: 17px 18px; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: start; gap: 13px; border: 1px solid color-mix(in srgb, var(--queue-blue) 28%, var(--queue-separator)); border-radius: 14px; background: color-mix(in srgb, var(--queue-soft-blue) 72%, var(--queue-card)); }
 .queue-self.is-warning { border-color: color-mix(in srgb, #ff9500 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-orange) 74%, var(--queue-card)); }
@@ -2031,10 +2045,11 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 
 .queue-online-entry { display: grid; min-height: 66px; margin: 0 0 16px; padding: 11px 12px; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 11px; border: 1px solid color-mix(in srgb, var(--queue-online) 24%, var(--queue-separator)); border-radius: 11px; background: color-mix(in srgb, var(--queue-soft-online) 48%, var(--queue-card)); }
 .queue-online-entry.is-disabled { border-color: var(--queue-separator); background: var(--queue-card); }
-.queue-online-entry-icon { display: grid; width: 36px; height: 36px; place-items: center; border-radius: 50%; color: var(--queue-online); background: var(--queue-card); }
+.queue-online-entry-icon { display: grid; width: 36px; height: 36px; place-items: center; border-radius: 50%; color: var(--queue-online); background: var(--queue-card); line-height: 0; }
+.queue-online-entry-icon > svg { display: block; }
 .queue-online-entry.is-disabled .queue-online-entry-icon { color: var(--queue-tertiary); background: var(--queue-position); }
 .queue-online-entry > div { min-width: 0; }
-.queue-online-entry strong, .queue-online-entry span { display: block; }
+.queue-online-entry > div > strong, .queue-online-entry > div > span { display: block; }
 .queue-online-entry > div > strong { font-size: 13px; font-weight: 620; line-height: 1.4; }
 .queue-online-entry > div > span { margin-top: 2px; color: var(--queue-secondary); font-size: 10px; line-height: 1.45; }
 .queue-online-entry > button { min-height: 36px; padding: 0 13px; border: 0; border-radius: 8px; color: #fff; background: var(--queue-blue); cursor: pointer; font-size: 11px; font-weight: 600; }

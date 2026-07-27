@@ -351,6 +351,11 @@ async function submitRegistration() {
     })
     applyCommandResult(result)
   } catch (error) {
+    if (error?.code === 'PLAYER_ALREADY_REGISTERED') {
+      step.value = 'CONFIRM'
+      errorDetail.value = error.message
+      return
+    }
     if (isTemporaryRequestError(error)) {
       step.value = 'SUBMIT_ERROR'
       resultDetail.value = error?.message || '暂时无法确认登记是否已经提交。'

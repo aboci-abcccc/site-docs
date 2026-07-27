@@ -231,6 +231,13 @@ async function loadProfiles(query) {
     profiles.value = Array.isArray(payload.profiles)
       ? payload.profiles.map(normalizeProfile).filter(Boolean)
       : []
+    const canonicalRememberedProfile = payload.profile_aliases?.[rememberedProfileId.value]
+    if (
+      canonicalRememberedProfile &&
+      profiles.value.some((profile) => profile.profileId === canonicalRememberedProfile)
+    ) {
+      rememberProfile(canonicalRememberedProfile)
+    }
     errorDetail.value = ''
   } catch (error) {
     if (sequence !== searchSequence) return

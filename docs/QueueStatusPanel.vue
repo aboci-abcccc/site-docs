@@ -25,6 +25,7 @@ const QUEUE_ONLINE_JOIN_API_URL = import.meta.env.VITE_QUEUE_ONLINE_JOIN_API_URL
 const QUEUE_ONLINE_COMMAND_API_BASE = import.meta.env.VITE_QUEUE_ONLINE_COMMAND_API_BASE ||
   QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'queue-online/commands')
 const REFRESH_INTERVAL = 10000
+const SNAPSHOT_STALE_AFTER = 90000
 const ONLINE_COMMAND_POLL_INTERVAL = 1500
 const SELF_STORAGE_KEY = 'maimai-q:marked-registration:v1'
 const MAX_SELF_REGISTRATION_HISTORY = 24
@@ -98,8 +99,19 @@ const totalRegistrationCount = computed(() => (
   machines.value.reduce((total, machine) => total + machine.registrationCount, 0)
 ))
 
+const snapshotAgeMillis = computed(() => {
+  const date = parseDate(capturedAt.value)
+  return date ? Math.max(0, currentTime.value - date.getTime()) : null
+})
+
+const snapshotStale = computed(() => (
+  hasSnapshot.value && (
+    snapshotAgeMillis.value === null || snapshotAgeMillis.value > SNAPSHOT_STALE_AFTER
+  )
+))
+
 const terminalOnline = computed(() => (
-  hasSnapshot.value && terminal.value?.online !== false
+  hasSnapshot.value && !snapshotStale.value && terminal.value?.online !== false
 ))
 
 const onlineRegistrationAvailable = computed(() => (
@@ -113,6 +125,7 @@ const onlineRegistrationAvailable = computed(() => (
 ))
 
 const onlineRegistrationSummary = computed(() => {
+  if (snapshotStale.value) return '队列数据已过期，暂不能线上加入排队'
   if (!hasSnapshot.value || !terminalOnline.value) return '现场终端离线，暂不能线上加入排队'
   if (capabilities.value?.online_registration !== true) return '现场暂未开放线上登记'
   if (registrationOpen.value === false) {
@@ -152,6 +165,7 @@ const availability = computed(() => {
   if (!hasSnapshot.value) {
     return { label: loading.value ? '正在连接排队终端' : '排队终端暂未接入', tone: 'offline' }
   }
+  if (snapshotStale.value) return { label: '队列数据已过期', tone: 'offline' }
   if (loadError.value) return { label: '连接暂时中断', tone: 'closed' }
   if (!terminalOnline.value) return { label: '排队终端离线', tone: 'offline' }
   if (businessHours.value.enabled && businessHours.value.outside) {
@@ -166,12 +180,14 @@ const outsideBusinessHours = computed(() => (
 ))
 
 const businessHoursClosingGrace = computed(() => (
+  terminalOnline.value &&
   businessHours.value.enabled &&
   businessHours.value.outside &&
   businessHours.value.closingGrace
 ))
 
 const businessHoursClosingSoon = computed(() => (
+  terminalOnline.value &&
   businessHours.value.enabled &&
   !businessHours.value.outside &&
   businessHours.value.closingSoon
@@ -180,6 +196,16 @@ const businessHoursClosingSoon = computed(() => (
 const capturedTimeText = computed(() => {
   const date = parseDate(capturedAt.value)
   if (!date) return '--:--'
+  if (snapshotStale.value) {
+    return `更新于 ${date.toLocaleString('zh-CN', {
+      month: 'numeric',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    })}`
+  }
   return date.toLocaleTimeString('zh-CN', {
     hour: '2-digit',
     minute: '2-digit',
@@ -779,6 +805,7 @@ function machineSummary(machine) {
 function playingLabel(machine) {
   const base = `游玩位置 ${machine.id}`
   if (!machine.playing.length) return base
+  if (!terminalOnline.value) return `${base} · 状态待更新`
   if (!machine.operational) return `${base} · 已暂停`
   const startedAt = parseDate(machine.playingStartedAt)
   if (!startedAt) return base
@@ -787,6 +814,7 @@ function playingLabel(machine) {
 }
 
 function playingOvertime(machine) {
+  if (!terminalOnline.value) return false
   if (!machine.operational) return false
   const startedAt = parseDate(machine.playingStartedAt)
   return Boolean(startedAt && currentTime.value - startedAt.getTime() > 20 * 60 * 1000)
@@ -822,6 +850,8 @@ function registrationTone(registration) {
 }
 
 function positionEstimateText(minutes, registrations = [], machine = null) {
+  if (snapshotStale.value) return '数据已过期，暂时无法估算'
+  if (!terminalOnline.value) return '终端恢复同步后重新估算'
   if (machine?.operational === false) return '机台恢复使用后重新估算'
   if (registrations.some((registration) => registration.onlineRegistrationPendingCheckIn)) {
     return '签到后可估算'
@@ -830,7 +860,7 @@ function positionEstimateText(minutes, registrations = [], machine = null) {
     return '暂时离开，无法估算'
   }
   if (minutes === null || minutes === undefined) return '暂时无法估算'
-  if (minutes <= 0) return '预计现在可以游玩'
+  if (minutes <= 0) return '不足 1 分钟后可以游玩'
   return `约 ${minutes} 分钟后可以游玩`
 }
 
@@ -914,6 +944,7 @@ function closeDetail() {
 
 function markedSelfStatusTitle() {
   const location = markedSelfLocation.value
+  if (!terminalOnline.value) return '队列状态等待更新'
   if (!location) {
     if (markedSelfAmbiguous.value) return '发现多份同名登记'
     if (markedSelf.value?.queueId !== queueId.value) return '当前队列中还没有你的登记'
@@ -931,6 +962,11 @@ function markedSelfStatusTitle() {
 
 function markedSelfStatusDetail() {
   const location = markedSelfLocation.value
+  if (!terminalOnline.value) {
+    return location
+      ? `最后一次同步时，你位于${location.label}。终端恢复同步后，请再确认当前安排。`
+      : `${snapshotStale.value ? '队列长时间没有更新' : '现场终端暂时离线'}，暂时无法确认你的当前状态。标记会继续保留。`
+  }
   if (!location) {
     if (markedSelfAmbiguous.value) {
       return `当前有多份昵称为“${markedSelf.value?.displayId}”的登记。请点开属于你的登记，并再次选择“标记为自己”。`
@@ -967,6 +1003,7 @@ function markedSelfStatusDetail() {
 
 function markedSelfTone() {
   const location = markedSelfLocation.value
+  if (!terminalOnline.value) return 'warning'
   if (!location) {
     if (markedSelfAmbiguous.value) return 'warning'
     return markedSelfLastEvent.value?.type.startsWith('NO_SHOW') ||
@@ -1151,6 +1188,10 @@ function selectOnlineJoinPreference(preference) {
 }
 
 async function queryOnlineProfile() {
+  if (!onlineRegistrationAvailable.value) {
+    onlineJoinError.value = `${onlineRegistrationSummary.value}，请等待页面刷新后重试。`
+    return
+  }
   const qqNumber = normalizeQqNumber(onlineJoinQq.value)
   if (!qqNumber) {
     onlineJoinError.value = '请输入 5 至 12 位 QQ 号。'
@@ -1219,10 +1260,12 @@ function profilePreferenceText(preference) {
 }
 
 function onlineMachineEstimateText(machine) {
+  if (snapshotStale.value) return '队列数据已过期'
+  if (!terminalOnline.value) return '现场终端离线'
   if (!machine?.available) return machine?.unavailableReason || '当前不可加入'
   const minutes = machine.estimatedWaitMinutes
   if (minutes === null || minutes === undefined) return '暂时无法估算'
-  if (minutes <= 0) return '预计现在可以游玩'
+  if (minutes <= 0) return '预计不足 1 分钟'
   return `新登记约 ${minutes} 分钟后可以游玩`
 }
 
@@ -1300,6 +1343,10 @@ async function pollOnlineJoinCommand() {
 }
 
 async function submitOnlineJoin() {
+  if (!onlineRegistrationAvailable.value) {
+    onlineJoinError.value = `${onlineRegistrationSummary.value}，请等待页面刷新后重试。`
+    return
+  }
   const profile = onlineJoinProfile.value
   const machine = selectedOnlineJoinMachine.value
   if (!profile || !machine?.available) {
@@ -1425,6 +1472,14 @@ onBeforeUnmount(() => {
     <section v-if="hasSnapshot && testData" class="queue-test-notice" aria-live="polite">
       <TriangleAlert :size="17" aria-hidden="true" />
       <strong>当前数据是测试数据。</strong>
+    </section>
+
+    <section v-if="hasSnapshot && snapshotStale" class="queue-stale-notice" aria-live="polite">
+      <TriangleAlert :size="17" aria-hidden="true" />
+      <div>
+        <strong>队列数据暂未更新</strong>
+        <span>{{ capturedTimeText }}。以下内容仅供辨认，时间估算已暂停显示。</span>
+      </div>
     </section>
 
     <section v-if="markedSelf" class="queue-self" :class="`is-${markedSelfTone()}`" aria-live="polite">
@@ -2046,6 +2101,11 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-test-notice { display: flex; margin: 0 0 16px; padding: 10px 12px; align-items: center; gap: 8px; border-left: 3px solid #ff9500; color: var(--queue-orange); background: color-mix(in srgb, var(--queue-soft-orange) 68%, var(--queue-card)); }
 .queue-test-notice svg { display: block; flex: 0 0 auto; }
 .queue-test-notice strong { font-size: 11px; font-weight: 620; line-height: 1.45; }
+.queue-stale-notice { display: flex; margin: 0 0 16px; padding: 11px 12px; align-items: flex-start; gap: 9px; border-left: 3px solid #ff9500; color: var(--queue-orange); background: color-mix(in srgb, var(--queue-soft-orange) 62%, var(--queue-card)); }
+.queue-stale-notice svg { display: block; flex: 0 0 auto; margin-top: 1px; }
+.queue-stale-notice div, .queue-stale-notice strong, .queue-stale-notice span { display: block; }
+.queue-stale-notice strong { font-size: 12px; font-weight: 650; line-height: 1.4; }
+.queue-stale-notice span { margin-top: 2px; color: var(--queue-secondary); font-size: 11px; line-height: 1.55; }
 
 .queue-self { display: grid; margin: 0 0 18px; padding: 17px 18px; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: start; gap: 13px; border: 1px solid color-mix(in srgb, var(--queue-blue) 28%, var(--queue-separator)); border-radius: 14px; background: color-mix(in srgb, var(--queue-soft-blue) 72%, var(--queue-card)); }
 .queue-self.is-warning { border-color: color-mix(in srgb, #ff9500 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-orange) 74%, var(--queue-card)); }

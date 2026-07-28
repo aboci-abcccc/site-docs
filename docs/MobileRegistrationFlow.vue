@@ -32,6 +32,12 @@ const DEFAULT_NOTIFICATIONS = Object.freeze({
   notify_absence: true,
   notify_machine_status: false
 })
+const PROFILE_FORM_ERROR_CODES = new Set([
+  'QQ_ALREADY_USED',
+  'NICKNAME_ALREADY_USED',
+  'NICKNAME_IN_QUEUE',
+  'PROFILE_SETTINGS_INVALID'
+])
 const step = ref('LOADING')
 const session = ref(null)
 const profiles = ref([])
@@ -283,11 +289,13 @@ function continueNewProfile() {
   selectedPreference.value = newProfileDraft.default_preference === 'ASK_EVERY_TIME'
     ? null
     : newProfileDraft.default_preference
+  errorDetail.value = ''
   step.value = 'CONFIRM'
 }
 
 function continueProfileCompletion() {
   if (!completionValid.value) return
+  errorDetail.value = ''
   step.value = 'CONFIRM'
 }
 
@@ -351,7 +359,17 @@ async function submitRegistration() {
     })
     applyCommandResult(result)
   } catch (error) {
-    if (error?.code === 'PLAYER_ALREADY_REGISTERED') {
+    if (PROFILE_FORM_ERROR_CODES.has(error?.code) && draftMode.value === 'NEW') {
+      step.value = 'NEW'
+      errorDetail.value = error.message
+      return
+    }
+    if (PROFILE_FORM_ERROR_CODES.has(error?.code) && draftMode.value === 'COMPLETE') {
+      step.value = 'COMPLETE'
+      errorDetail.value = error.message
+      return
+    }
+    if (['PLAYER_ALREADY_REGISTERED', 'PLAYER_OPERATION_PENDING'].includes(error?.code)) {
       step.value = 'CONFIRM'
       errorDetail.value = error.message
       return
@@ -538,6 +556,7 @@ onBeforeUnmount(() => {
             </div></fieldset>
             <MobileProfileSettings :settings="newProfileDraft" :bot-qq="botQq"
               @change="updateDraft(newProfileDraft, $event)" />
+            <p v-if="errorDetail" class="mobile-form-error" role="alert">{{ errorDetail }}</p>
             <button class="mobile-primary" type="submit" :disabled="!newProfileValid">继续核对</button>
           </form>
         </template>
@@ -552,6 +571,7 @@ onBeforeUnmount(() => {
             <p v-else class="mobile-information"><Check :size="17" aria-hidden="true" />原有 QQ 会继续保留，无需重新填写。</p>
             <MobileProfileSettings :settings="completionDraft" :bot-qq="botQq"
               @change="updateDraft(completionDraft, $event)" />
+            <p v-if="errorDetail" class="mobile-form-error" role="alert">{{ errorDetail }}</p>
             <button class="mobile-primary" type="submit" :disabled="!completionValid">继续核对</button>
           </form>
         </template>

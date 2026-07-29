@@ -9,6 +9,10 @@
 
 这也许不是最新的版本。可以前往 [我的 Github](https://github.com/aboci-abcccc/Physics-notes-of-ordinary-high-school/blob/master/%E9%AB%98%E4%B8%AD%E7%89%A9%E7%90%86%E5%AD%A6/%E9%AB%98%E4%B8%AD%E7%89%A9%E7%90%86%E5%AD%A6.pdf) 获取最新内容。
 
+受限于服务器带宽，文件下载可能较慢。
+
+本书开源，默认授权以学习、分享为由的下载使用。
+
 ## 高中化学（部分）
 
 这是试作的《硫及其化合物》的知识梳理。

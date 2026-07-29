@@ -9,6 +9,7 @@ dist/
 .vitepress/dist/
 .vitepress/cache/
 .temp/
+.codex-tmp/
 docs/.vitepress/dist
 
 # 日志

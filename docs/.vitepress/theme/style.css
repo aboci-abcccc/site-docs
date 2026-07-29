@@ -155,7 +155,6 @@ p {
 
 .get-gloves-page .VPLocalNav,
 .maimai-queue-page .VPLocalNav,
-.maimai-counter-page .VPLocalNav,
 .maimai-board-page .VPLocalNav {
     display: none;
 }
@@ -213,381 +212,431 @@ p {
     text-decoration: none;
 }
 
-/* 金街舞萌公告板与子页面导航 */
-.maimai-board-page {
-    --maimai-blue: #58d5ff;
-    --maimai-green: #66e6af;
-    --maimai-yellow: #ffd16e;
-    --maimai-pink: #ff8fa3;
+/* 金街舞萌公告板：移动端优先的系统式界面 */
+.maimai-board-page,
+.get-gloves-page,
+.maimai-queue-page {
+    --maimai-bg: #f5f5f7;
+    --maimai-surface: #ffffff;
+    --maimai-line: #e5e5ea;
+    --maimai-label: #1d1d1f;
+    --maimai-secondary: #6e6e73;
+    --maimai-blue: #007aff;
+}
+
+.maimai-board-page .VPContent,
+.maimai-queue-page .VPContent {
+    padding: 0 !important;
+}
+
+.maimai-board-page .VPPage,
+.maimai-queue-page .VPPage,
+.get-gloves-page .VPContent {
+    background: var(--maimai-bg);
 }
 
 .maimai-board-page .VPPage {
     min-height: 100vh;
-    padding: 72px 24px 88px;
-    background:
-        radial-gradient(circle at 18% 5%, rgba(88, 213, 255, 0.16), transparent 34%),
-        radial-gradient(circle at 88% 22%, rgba(102, 230, 175, 0.12), transparent 30%),
-        var(--vp-c-bg);
+    padding: max(28px, env(safe-area-inset-top)) 16px max(36px, env(safe-area-inset-bottom));
 }
 
-.maimai-board-page .VPContent {
-    padding: 0 !important;
+.maimai-board-page .VPPage > div,
+.maimai-home {
+    width: 100%;
+    max-width: 680px;
+    margin: 0 auto;
 }
 
-.maimai-board-page .VPPage > div {
-    max-width: 1040px;
-    margin-right: auto;
-    margin-left: auto;
+.maimai-home-header {
+    padding: 8px 4px 30px;
 }
 
-.maimai-board-hero {
-    margin-bottom: 38px;
-    text-align: center;
+.maimai-home-header p,
+.maimai-home-header h1,
+.maimai-home-header span {
+    letter-spacing: 0;
 }
 
-.maimai-board-kicker {
-    margin: 0 0 12px;
+.maimai-home-header p {
+    margin: 0 0 7px;
     color: var(--maimai-blue);
-    font-size: 12px;
-    font-weight: 800;
-    letter-spacing: 0.2em;
+    font-size: 13px;
+    font-weight: 600;
 }
 
-.maimai-board-hero h1 {
+.maimai-home-header h1 {
     margin: 0;
     border: 0;
-    font-size: clamp(42px, 8vw, 76px);
-    line-height: 1.08;
-    letter-spacing: -0.04em;
+    color: var(--maimai-label);
+    font-size: 32px;
+    font-weight: 700;
+    line-height: 1.18;
 }
 
-.maimai-board-hero > p:last-child {
-    margin: 16px 0 0;
-    color: var(--vp-c-text-2);
-    font-size: 16px;
+.maimai-home-header span {
+    display: block;
+    margin-top: 9px;
+    color: var(--maimai-secondary);
+    font-size: 14px;
+    line-height: 1.5;
 }
 
-.maimai-board-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 18px;
+.maimai-service-section h2,
+.maimai-contact-section h2 {
+    margin: 0 0 8px 4px;
+    border: 0;
+    color: var(--maimai-secondary);
+    font-size: 13px;
+    font-weight: 500;
 }
 
-.maimai-board-card {
+.maimai-service-list,
+.maimai-contact-list {
+    overflow: hidden;
+    border: 1px solid rgba(0, 0, 0, 0.04);
+    border-radius: 8px;
+    background: var(--maimai-surface);
+}
+
+.maimai-service-row,
+.maimai-contact-list a {
     position: relative;
     display: flex;
-    min-height: 190px;
-    padding: 27px;
-    overflow: hidden;
+    min-height: 68px;
+    align-items: center;
+    color: var(--maimai-label);
+    text-decoration: none;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.maimai-service-row {
+    padding: 9px 12px;
+    gap: 12px;
+}
+
+.maimai-service-row::after,
+.maimai-contact-list a::after {
+    content: '';
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    height: 1px;
+    background: var(--maimai-line);
+}
+
+.maimai-service-row::after {
+    left: 64px;
+}
+
+.maimai-service-row:last-child::after,
+.maimai-contact-list a:last-child::after {
+    display: none;
+}
+
+.maimai-service-row:active,
+.maimai-contact-list a:active {
+    background: #eeeeef;
+}
+
+.maimai-service-icon,
+.maimai-contact-icon {
+    display: grid;
+    flex: 0 0 auto;
+    place-items: center;
+    border-radius: 8px;
+    color: #ffffff;
+}
+
+.maimai-service-icon {
+    width: 40px;
+    height: 40px;
+}
+
+.maimai-service-icon.is-blue { background: #007aff; }
+.maimai-service-icon.is-green { background: #30b253; }
+.maimai-service-icon.is-orange { background: #ff9500; }
+.maimai-service-icon.is-purple { background: #7654c6; }
+.maimai-service-icon.is-pink { background: #e34d73; }
+
+.maimai-service-copy,
+.maimai-contact-list a > span:nth-child(2) {
+    display: flex;
+    min-width: 0;
+    flex: 1;
     flex-direction: column;
-    border: 1px solid var(--vp-c-divider);
-    border-radius: 22px;
-    color: var(--vp-c-text-1);
-    background: color-mix(in srgb, var(--vp-c-bg-soft) 88%, transparent);
-    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.1);
-    text-decoration: none;
-    transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
 }
 
-.maimai-board-card:hover {
-    transform: translateY(-4px);
-    border-color: currentColor;
-    box-shadow: 0 26px 60px rgba(0, 0, 0, 0.16);
-    text-decoration: none;
+.maimai-service-copy strong,
+.maimai-contact-list strong {
+    overflow-wrap: anywhere;
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 1.3;
 }
 
-.maimai-board-card.items { color: var(--maimai-blue); }
-.maimai-board-card.rules { color: var(--maimai-green); }
-.maimai-board-card.thanks { color: var(--maimai-yellow); }
-.maimai-board-card.counter { color: var(--maimai-pink); }
-
-.maimai-card-icon {
-    margin-bottom: 20px;
-    font-size: 27px;
-    line-height: 1;
+.maimai-service-copy small,
+.maimai-contact-list small {
+    margin-top: 3px;
+    overflow-wrap: anywhere;
+    color: var(--maimai-secondary);
+    font-size: 12px;
+    line-height: 1.35;
 }
 
-.maimai-board-card strong {
-    color: var(--vp-c-text-1);
-    font-size: 23px;
+.maimai-service-chevron,
+.maimai-contact-list a > svg {
+    flex: 0 0 auto;
+    color: #b7b7bc;
 }
 
-.maimai-board-card small {
-    margin-top: 7px;
-    color: var(--vp-c-text-2);
-    font-size: 14px;
+.maimai-contact-section {
+    margin-top: 28px;
 }
 
-.maimai-card-arrow {
-    margin-top: auto;
-    padding-top: 18px;
-    font-size: 13px;
-    font-weight: 800;
+.maimai-contact-list a {
+    min-height: 62px;
+    padding: 8px 12px;
+    gap: 12px;
 }
 
-.maimai-board-contact {
-    margin-top: 26px !important;
-    padding: 20px 24px;
-    border: 1px solid var(--vp-c-divider);
-    border-radius: 16px;
-    color: var(--vp-c-text-2);
-    background: var(--vp-c-bg-soft);
+.maimai-contact-list a::after {
+    left: 58px;
+}
+
+.maimai-contact-icon {
+    width: 34px;
+    height: 34px;
+}
+
+.maimai-contact-icon.is-blue { background: #007aff; }
+.maimai-contact-icon.is-gray { background: #73737a; }
+
+.maimai-home-footer {
+    padding: 24px 4px 4px;
+    color: #8e8e93;
+    font-size: 12px;
     text-align: center;
 }
 
-.maimai-board-contact p {
-    margin: 4px 0;
+/* 公告板子页面 */
+.get-gloves-page .VPDoc {
+    max-width: 100%;
+    padding: 0;
+}
+
+.get-gloves-page .VPDoc .container {
+    width: 100%;
+    max-width: 820px;
+    padding: 24px 18px 64px;
+}
+
+.get-gloves-page .VPDoc .content,
+.get-gloves-page .VPDoc .content-container {
+    max-width: 100%;
+}
+
+.get-gloves-page .vp-doc h1 {
+    margin: 0;
+    color: var(--maimai-label);
+    font-size: 30px;
+    line-height: 1.2;
+    letter-spacing: 0;
+}
+
+.get-gloves-page .vp-doc h2 {
+    margin-top: 42px;
+    padding-top: 0;
+    border-top: 0;
+    font-size: 23px;
+    letter-spacing: 0;
+}
+
+.get-gloves-page .vp-doc h3 {
+    margin-top: 30px;
+    font-size: 18px;
+    letter-spacing: 0;
+}
+
+.get-gloves-page .vp-doc p,
+.get-gloves-page .vp-doc li {
+    font-size: 15px;
+    line-height: 1.75;
+}
+
+.get-gloves-page .vp-doc table {
+    display: block;
+    width: 100%;
+    overflow-x: auto;
+    white-space: nowrap;
+    -webkit-overflow-scrolling: touch;
+}
+
+.get-gloves-page .vp-doc div[class*='language-'],
+.get-gloves-page .vp-doc .custom-block,
+.item-page-index {
+    border-radius: 8px;
 }
 
 .maimai-page-nav {
-    margin: 22px 0 34px;
+    display: flex;
+    width: 100%;
+    margin: 18px 0 30px;
+    align-items: stretch;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.maimai-page-nav:first-of-type {
+    position: sticky;
+    top: 8px;
+    z-index: 20;
+}
+
+.maimai-back,
+.maimai-page-links a {
+    display: inline-flex;
+    height: 42px;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    color: var(--maimai-secondary);
+    background: rgba(255, 255, 255, 0.94);
+    font-size: 12px;
+    font-weight: 600;
+    text-decoration: none;
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
 }
 
 .maimai-back {
-    display: inline-flex;
-    align-items: center;
-    min-height: 40px;
-    padding: 0 15px;
-    border: 1px solid var(--vp-c-divider);
-    border-radius: 11px;
-    color: var(--vp-c-text-2);
-    background: var(--vp-c-bg-soft);
-    font-size: 14px;
-    font-weight: 700;
-    text-decoration: none;
+    height: 36px;
+    align-self: flex-start;
+    padding: 0 10px 0 7px;
+    gap: 1px;
+    border-radius: 8px;
+    color: var(--maimai-blue);
 }
 
 .maimai-page-links {
     display: grid;
+    width: 100%;
+    margin: 0;
     grid-template-columns: repeat(5, minmax(0, 1fr));
-    gap: 9px;
-    margin-top: 12px;
+    gap: 4px;
+    overflow: visible;
 }
 
 .maimai-page-links a {
-    display: flex;
-    min-height: 44px;
-    padding: 8px 12px;
-    align-items: center;
-    justify-content: center;
-    gap: 7px;
-    border: 1px solid var(--vp-c-divider);
-    border-radius: 11px;
-    color: var(--vp-c-text-2);
-    background: var(--vp-c-bg-soft);
-    font-size: 13px;
-    font-weight: 700;
-    text-align: center;
-    text-decoration: none;
-}
-
-.maimai-page-links a:hover,
-.maimai-page-links a.active {
-    border-color: var(--vp-c-brand-1);
-    color: var(--vp-c-brand-1);
-    text-decoration: none;
+    width: 100%;
+    min-width: 0;
+    height: 48px;
+    padding: 0 2px;
+    flex-direction: column;
+    gap: 2px;
+    border-radius: 8px;
+    font-size: 11px;
 }
 
 .maimai-page-links a.active {
+    border-color: transparent;
+    color: #ffffff;
+    background: var(--maimai-blue);
     pointer-events: none;
 }
 
-.maimai-counter-page .VPPage {
-    padding: 32px 20px 70px;
-}
-
-.maimai-counter-page .maimai-page-nav {
-    max-width: 1080px;
-    margin-right: auto;
-    margin-left: auto;
-}
-
 .maimai-queue-page .VPPage {
-    padding: 32px 20px 70px;
+    min-height: 100vh;
+    padding: 12px 10px 48px;
 }
 
 .maimai-queue-page .maimai-page-nav {
-    max-width: 1080px;
+    max-width: 820px;
     margin-right: auto;
     margin-left: auto;
 }
 
-.terminal-guide {
-    max-width: 1080px;
-    margin: 8px auto 44px;
-    padding: 30px;
-    border: 1px solid rgba(145, 178, 216, 0.18);
-    border-radius: 22px;
-    color: #f4f8ff;
-    background:
-        radial-gradient(circle at 92% 0, rgba(59, 216, 255, 0.12), transparent 34%),
-        linear-gradient(145deg, #122640, #0d1c30);
-    box-shadow: 0 22px 50px rgba(0, 0, 0, 0.18);
+.dark .maimai-board-page,
+.dark .get-gloves-page,
+.dark .maimai-queue-page {
+    --maimai-bg: #000000;
+    --maimai-surface: #1c1c1e;
+    --maimai-line: #38383a;
+    --maimai-label: #f5f5f7;
+    --maimai-secondary: #a1a1a6;
+    --maimai-blue: #0a84ff;
 }
 
-.terminal-guide-heading > p {
-    margin: 0;
-    color: #3bd8ff;
-    font-size: 12px;
-    font-weight: 800;
-    letter-spacing: 0.15em;
+.dark .maimai-service-list,
+.dark .maimai-contact-list,
+.dark .maimai-back,
+.dark .maimai-page-links a {
+    border-color: rgba(255, 255, 255, 0.08);
 }
 
-.terminal-guide-heading h2 {
-    margin: 6px 0 8px;
-    border: 0;
-    color: #f4f8ff;
-    font-size: clamp(25px, 4vw, 36px);
+.dark .maimai-back,
+.dark .maimai-page-links a {
+    background: rgba(28, 28, 30, 0.94);
 }
 
-.terminal-guide-heading > span {
-    color: #91a5bf;
+.dark .maimai-page-links a.active {
+    background: var(--maimai-blue);
 }
 
-.terminal-guide-steps {
-    display: grid;
-    margin: 26px 0 0;
-    padding: 0;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 12px;
-    list-style: none;
-    counter-reset: terminal-step;
-}
-
-.terminal-guide-steps li {
-    position: relative;
-    min-height: 118px;
-    padding: 20px 20px 18px 58px;
-    border: 1px solid rgba(145, 178, 216, 0.14);
-    border-radius: 15px;
-    background: rgba(255, 255, 255, 0.035);
-    counter-increment: terminal-step;
-}
-
-.terminal-guide-steps li::before {
-    content: counter(terminal-step);
-    position: absolute;
-    top: 19px;
-    left: 18px;
-    display: grid;
-    width: 27px;
-    height: 27px;
-    place-items: center;
-    border-radius: 8px;
-    color: #03121e;
-    background: #3bd8ff;
-    font-size: 13px;
-    font-weight: 900;
-}
-
-.terminal-guide-steps strong,
-.terminal-guide-steps span {
-    display: block;
-}
-
-.terminal-guide-steps strong {
-    margin-bottom: 6px;
-    color: #f4f8ff;
-}
-
-.terminal-guide-steps span {
-    color: #a8bad0;
-    font-size: 14px;
-    line-height: 1.65;
-}
-
-.terminal-guide-steps span + span {
-    margin-top: 4px;
-}
-
-.terminal-guide-steps code {
-    margin-right: 3px;
-    color: #8be7ff;
-    background: rgba(59, 216, 255, 0.1);
-}
-
-.terminal-guide-note {
-    display: flex;
-    margin-top: 13px;
-    padding: 15px 17px;
-    align-items: flex-start;
-    gap: 10px;
-    border: 1px solid rgba(255, 200, 96, 0.22);
-    border-radius: 13px;
-    color: #c2d0e1;
-    background: rgba(255, 200, 96, 0.07);
-    font-size: 14px;
-}
-
-.terminal-guide-note strong {
-    flex: 0 0 auto;
-    color: #ffda92;
-}
-
-@media (max-width: 700px) {
-    .get-gloves-page .VPDoc .content-container {
-        padding: 0 2px;
-    }
-
-    .get-gloves-page .VPDoc h1 {
-        font-size: 30px;
-    }
-
-    .item-page-index {
-        margin: 16px 0 24px;
-        padding: 14px;
-    }
-
-    .item-index-group {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 7px;
-    }
-
-    .item-index-group a {
-        width: 100%;
-        justify-content: center;
-        text-align: center;
-    }
-
+@media (min-width: 700px) {
     .maimai-board-page .VPPage {
-        padding: 42px 15px 60px;
+        padding: 58px 24px 72px;
     }
 
-    .maimai-board-grid {
-        grid-template-columns: 1fr;
+    .maimai-home-header {
+        padding: 12px 6px 38px;
     }
 
-    .maimai-board-card {
-        min-height: 165px;
-        padding: 23px;
+    .maimai-home-header h1 {
+        font-size: 40px;
+    }
+
+    .maimai-service-row {
+        min-height: 76px;
+        padding: 10px 16px;
+    }
+
+    .maimai-service-row:hover,
+    .maimai-contact-list a:hover {
+        background: #f4f4f5;
+        text-decoration: none;
+    }
+
+    .dark .maimai-service-row:hover,
+    .dark .maimai-contact-list a:hover {
+        background: #2c2c2e;
+    }
+
+    .get-gloves-page .VPDoc .container {
+        padding: 48px 32px 88px;
+    }
+
+    .get-gloves-page .vp-doc h1 {
+        font-size: 38px;
     }
 
     .maimai-page-links {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        flex: 1;
     }
 
-    .maimai-counter-page .VPPage {
-        padding: 12px 8px 42px;
+    .maimai-page-links a {
+        flex-direction: row;
+        gap: 5px;
+        font-size: 12px;
+    }
+
+.maimai-page-nav {
+        align-items: center;
+        flex-direction: row;
+        gap: 8px;
     }
 
     .maimai-queue-page .VPPage {
-        padding: 12px 8px 42px;
-    }
-
-    .terminal-guide {
-        margin-bottom: 28px;
-        padding: 22px 16px;
-        border-radius: 18px;
-    }
-
-    .terminal-guide-steps {
-        grid-template-columns: 1fr;
-    }
-
-    .terminal-guide-note {
-        flex-direction: column;
-        gap: 4px;
+        padding: 28px 20px 72px;
     }
 }
 

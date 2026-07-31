@@ -2366,10 +2366,6 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
   .queue-detail-dialog, .queue-confirm-dialog { width: 100%; max-height: calc(100vh - 20px); padding: 18px; border-radius: 14px; }
 }
 
-@media (max-width: 370px) {
-  .queue-registration-grid { grid-template-columns: minmax(0, 1fr); }
-}
-
 @media (prefers-reduced-motion: reduce) {
   .spinning { animation: none; }
   .queue-dialog-enter-active, .queue-dialog-leave-active,

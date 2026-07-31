@@ -90,6 +90,7 @@ const onlineJoinError = ref('')
 const onlineJoinCommandId = ref(null)
 const onlineJoinQueueId = ref(null)
 const onlineJoinResultDetail = ref('')
+const onlineJoinTerminalApplied = ref(false)
 const mobileRegistrationToken = ref('')
 let refreshTimer
 let clockTimer
@@ -1157,6 +1158,7 @@ function resetOnlineJoin() {
   onlineJoinCommandId.value = null
   onlineJoinQueueId.value = null
   onlineJoinResultDetail.value = ''
+  onlineJoinTerminalApplied.value = false
 }
 
 function openOnlineJoin() {
@@ -1238,6 +1240,7 @@ function backToOnlineLookup() {
   onlineJoinExistingRegistration.value = null
   onlineJoinPreference.value = null
   onlineJoinCommandId.value = null
+  onlineJoinTerminalApplied.value = false
   onlineJoinError.value = ''
 }
 
@@ -1313,6 +1316,26 @@ function scheduleOnlineCommandPoll() {
   onlineCommandTimer = window.setTimeout(pollOnlineJoinCommand, ONLINE_COMMAND_POLL_INTERVAL)
 }
 
+function findAppliedOnlineRegistration(command) {
+  const resultRegistrationId = command?.result_registration_id ?? command?.resultRegistrationId
+  if (resultRegistrationId) {
+    return registrationLocations.value.find(({ registration }) => (
+      registration.registrationId === resultRegistrationId
+    )) || null
+  }
+
+  const profileNickname = normalizePlayerNickname(onlineJoinProfile.value?.nickname)
+  if (!profileNickname) return null
+  const targetMachineId = command?.payload?.machine_id ?? command?.payload?.machineId ??
+    onlineJoinMachineId.value
+  const matches = registrationLocations.value.filter(({ registration, machine }) => (
+    machine.id === targetMachineId &&
+    registration.onlineRegistrationPendingCheckIn &&
+    normalizePlayerNickname(registration.displayId) === profileNickname
+  ))
+  return matches.length === 1 ? matches[0] : null
+}
+
 async function pollOnlineJoinCommand() {
   const commandId = onlineJoinCommandId.value
   if (!commandId) return
@@ -1328,12 +1351,21 @@ async function pollOnlineJoinCommand() {
       return
     }
     if (command.status === 'APPLIED') {
+      onlineJoinTerminalApplied.value = true
+      await loadQueue(true)
+      if (commandId !== onlineJoinCommandId.value) return
+      const appliedLocation = findAppliedOnlineRegistration(command)
+      if (!appliedLocation) {
+        scheduleOnlineCommandPoll()
+        return
+      }
       onlineJoinResultDetail.value = command.result_detail || '线上登记已经加入等待顺序。'
       onlineJoinStep.value = 'SUCCESS'
-      markOnlinePlayerAsSelf(null, false)
-      await loadQueue(true)
+      markOnlinePlayerAsSelf(appliedLocation.registration, false)
+      onlineJoinCommandId.value = null
       return
     }
+    onlineJoinTerminalApplied.value = false
     onlineJoinResultDetail.value = command.result_detail || '现场终端没有执行这次线上登记。'
     onlineJoinCommandId.value = null
     onlineJoinStep.value = 'REJECTED'
@@ -1362,6 +1394,7 @@ async function submitOnlineJoin() {
   }
   const requestId = onlineJoinCommandId.value || createRequestId()
   onlineJoinCommandId.value = requestId
+  onlineJoinTerminalApplied.value = false
   onlineJoinLoading.value = true
   onlineJoinError.value = ''
   try {
@@ -1858,8 +1891,10 @@ onBeforeUnmount(() => {
               <span class="queue-online-result-icon" aria-hidden="true">
                 <RefreshCw :size="23" class="spinning" />
               </span>
-              <strong>正在等待现场终端确认</strong>
-              <p>请保持页面打开。终端处理完成后，这里会显示最终结果；重复点击不会建立多份登记。</p>
+              <strong>{{ onlineJoinTerminalApplied ? '终端已保存，正在同步队列' : '正在等待现场终端确认' }}</strong>
+              <p>{{ onlineJoinTerminalApplied
+                ? '正在核对最新队列位置，确认登记显示后才会完成。'
+                : '请保持页面打开。终端处理完成后，这里会显示最终结果；重复点击不会建立多份登记。' }}</p>
               <p v-if="!onlineJoinProfile?.setupComplete">终端确认创建后，到场时须先补全玩家资料，才能签到。</p>
               <button class="queue-online-secondary" type="button" @click="closeOnlineJoin">在后台等待</button>
             </div>
@@ -2173,7 +2208,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-position-heading { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .queue-position-heading small { color: var(--queue-secondary); font-size: 10px; font-weight: 450; line-height: 1.45; }
 .queue-position-empty { display: grid; min-height: 72px; place-items: center; color: var(--queue-tertiary); font-size: 12px; }
-.queue-registration-grid { display: grid; min-width: 0; margin-top: 6px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.queue-registration-grid { display: grid; min-width: 0; margin-top: 6px; grid-template-columns: repeat(auto-fit, minmax(min(96px, 100%), 1fr)); gap: 7px; }
 .queue-overtime:only-child { grid-column: 1 / -1; }
 .queue-registration, .queue-overtime { min-width: 0; min-height: 70px; border-radius: 8px; background: var(--queue-card); }
 .queue-registration { position: relative; display: flex; padding: 10px 28px 10px 10px; justify-content: center; flex-direction: column; border: 1px solid transparent; color: inherit; text-align: left; cursor: pointer; transition: background .16s ease, border-color .16s ease, transform .12s ease; -webkit-tap-highlight-color: transparent; }

@@ -70,63 +70,44 @@ jobs:
             --notes "Automated deployment package for ${GITHUB_SHA}." \
             --latest
 
-      - name: Upload package to server
-        uses: appleboy/scp-action@v1
-        with:
-          host: ${{ secrets.HOST }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          source: "site-docs-dist.tar.gz,site-docs-dist.tar.gz.sha256"
-          target: "/tmp/site-docs-deploy-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Configure deployment SSH
+        env:
+          SSH_HOST: ${{ secrets.HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          install -d -m 0700 "${HOME}/.ssh"
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > "${HOME}/.ssh/deploy_key"
+          chmod 0600 "${HOME}/.ssh/deploy_key"
+          timeout 20s ssh-keyscan -T 10 -H "${SSH_HOST}" >> "${HOME}/.ssh/known_hosts"
 
-      - name: Verify package and update site
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.HOST }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          script: |
-            set -eu
+      - name: Sync changed files to server
+        env:
+          SSH_HOST: ${{ secrets.HOST }}
+          SSH_USER: ${{ secrets.USERNAME }}
+        run: |
+          set -eu
 
-            ASSET="${{ env.RELEASE_ASSET }}"
-            DEPLOY_TARGET="${{ env.DEPLOY_TARGET }}"
-            UPLOAD_DIR="/tmp/site-docs-deploy-${{ github.run_id }}-${{ github.run_attempt }}"
+          RESOLVED_TARGET="$(ssh -i "${HOME}/.ssh/deploy_key" -o BatchMode=yes \
+            "${SSH_USER}@${SSH_HOST}" "readlink -f '${DEPLOY_TARGET}'")"
+          test "${RESOLVED_TARGET}" = "${DEPLOY_TARGET}"
 
-            case "${DEPLOY_TARGET}" in
-              ""|"/")
-                echo "Invalid DEPLOY_TARGET: ${DEPLOY_TARGET}" >&2
-                exit 1
-                ;;
-            esac
+          rsync -rlptz \
+            --checksum \
+            --delete-delay \
+            --delay-updates \
+            --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
+            -e "ssh -i ${HOME}/.ssh/deploy_key -o BatchMode=yes" \
+            docs/.vitepress/dist/ \
+            "${SSH_USER}@${SSH_HOST}:${DEPLOY_TARGET}/"
 
-            case "${UPLOAD_DIR}" in
-              /tmp/site-docs-deploy-*)
-                ;;
-              *)
-                echo "Invalid UPLOAD_DIR: ${UPLOAD_DIR}" >&2
-                exit 1
-                ;;
-            esac
+      - name: Verify live site version
+        env:
+          SSH_HOST: ${{ secrets.HOST }}
+          SSH_USER: ${{ secrets.USERNAME }}
+        run: |
+          set -eu
 
-            TMP_DIR="$(mktemp -d)"
-            cleanup() {
-              rm -rf "${TMP_DIR}" "${UPLOAD_DIR}"
-            }
-            trap cleanup EXIT
-
-            test -f "${UPLOAD_DIR}/${ASSET}"
-            test -f "${UPLOAD_DIR}/${ASSET}.sha256"
-            cd "${UPLOAD_DIR}"
-            sha256sum -c "${ASSET}.sha256"
-
-            mkdir -p "${TMP_DIR}/site" "${DEPLOY_TARGET}"
-            tar -xzf "${ASSET}" -C "${TMP_DIR}/site"
-
-            if command -v rsync >/dev/null 2>&1; then
-              rsync -a --delete "${TMP_DIR}/site/" "${DEPLOY_TARGET}/"
-            else
-              find "${DEPLOY_TARGET}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-              cp -a "${TMP_DIR}/site/." "${DEPLOY_TARGET}/"
-            fi
-
-            echo "Updated ${DEPLOY_TARGET} to $(cat "${DEPLOY_TARGET}/.deploy-sha")"
+          LIVE_SHA="$(ssh -i "${HOME}/.ssh/deploy_key" -o BatchMode=yes \
+            "${SSH_USER}@${SSH_HOST}" "cat '${DEPLOY_TARGET}/.deploy-sha'")"
+          test "${LIVE_SHA}" = "${GITHUB_SHA}"
+          echo "Updated ${DEPLOY_TARGET} to ${LIVE_SHA}"

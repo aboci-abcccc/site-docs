@@ -860,7 +860,7 @@ function positionEstimateText(minutes, registrations = [], machine = null) {
     return '暂时离开，无法估算'
   }
   if (minutes === null || minutes === undefined) return '暂时无法估算'
-  if (minutes <= 0) return '不足 1 分钟后可以游玩'
+  if (minutes <= 0) return '预计很快可以游玩'
   return `约 ${minutes} 分钟后可以游玩`
 }
 
@@ -1265,7 +1265,7 @@ function onlineMachineEstimateText(machine) {
   if (!machine?.available) return machine?.unavailableReason || '当前不可加入'
   const minutes = machine.estimatedWaitMinutes
   if (minutes === null || minutes === undefined) return '暂时无法估算'
-  if (minutes <= 0) return '预计不足 1 分钟'
+  if (minutes <= 0) return '预计很快可以游玩'
   return `新登记约 ${minutes} 分钟后可以游玩`
 }
 

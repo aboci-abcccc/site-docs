@@ -119,6 +119,7 @@ const onlineRegistrationAvailable = computed(() => (
   hasSnapshot.value &&
   terminalOnline.value &&
   capabilities.value?.online_registration === true &&
+  !businessHoursClosingGrace.value &&
   registrationOpen.value !== false &&
   machines.value.some((machine) => (
     machine.synced && machine.operational && machine.registrationCount < 20
@@ -129,6 +130,7 @@ const onlineRegistrationSummary = computed(() => {
   if (snapshotStale.value) return '队列数据已过期，暂不能线上加入排队'
   if (!hasSnapshot.value || !terminalOnline.value) return '现场终端离线，暂不能线上加入排队'
   if (capabilities.value?.online_registration !== true) return '现场暂未开放线上登记'
+  if (businessHoursClosingGrace.value) return '闭店收尾期间不再接收新的排队登记'
   if (registrationOpen.value === false) {
     return outsideBusinessHours.value ? '当前不接收新的排队登记' : '当前采用现场自然排队'
   }
@@ -380,6 +382,8 @@ function normalizeRegistration(source, index) {
     ).toUpperCase(),
     qqNumber: normalizeQqNumber(source?.qq_number ?? source?.qqNumber),
     createdAt: source?.created_at ?? source?.createdAt ?? null,
+    onlineCheckInStartedAt:
+      source?.online_check_in_started_at ?? source?.onlineCheckInStartedAt ?? null,
     lastPlayedAt: source?.last_played_at ?? source?.lastPlayedAt ?? null
   }
 }
@@ -983,13 +987,21 @@ function markedSelfStatusDetail() {
   }
   const registration = location.registration
   if (!location.machine.operational) {
+    const playingTimerNotice = location.machine.playing.length
+      ? '本轮游玩计时会在恢复正常使用后从头开始。'
+      : ''
+    const checkInTimerNotice = registration.onlineRegistrationPendingCheckIn
+      ? '机台停止使用期间，30 分钟签到计时暂停；恢复正常使用后会从头开始。'
+      : ''
     return `停止原因：${stopReasonLabel(
       location.machine.stopReason,
       location.machine.stopReasonDetail
-    )}。登记顺序仍然保留，机台恢复正常使用后会重新开始本轮计时。`
+    )}。登记顺序仍然保留。${playingTimerNotice}${checkInTimerNotice}`
   }
   if (registration.onlineRegistrationPendingCheckIn) {
-    return '请在创建登记后的 30 分钟内，到现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。'
+    return hasRestartedOnlineCheckInWindow(registration)
+      ? '机台恢复正常使用后，这份登记已重新获得 30 分钟签到时限。请在本次时限内到现场终端点击自己的登记并选择“已到场”；超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。'
+      : '请在创建登记后的 30 分钟内，到现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。'
   }
   if (registration.temporarilyAway) {
     const skipped = registration.temporaryAwaySkippedTurns
@@ -1008,7 +1020,9 @@ function markedSelfTone() {
   if (!location) {
     if (markedSelfAmbiguous.value) return 'warning'
     return markedSelfLastEvent.value?.type.startsWith('NO_SHOW') ||
-      markedSelfLastEvent.value?.type === 'TEMPORARY_AWAY_EXPIRED'
+      markedSelfLastEvent.value?.type === 'TEMPORARY_AWAY_EXPIRED' ||
+      markedSelfLastEvent.value?.type === 'ONLINE_CHECK_IN_TIMED_OUT' ||
+      markedSelfLastEvent.value?.type === 'ONLINE_CHECK_IN_MISSED'
       ? 'danger'
       : 'muted'
   }
@@ -1025,6 +1039,10 @@ function eventOutcomeTitle(event) {
     NO_SHOW_MOVED_TO_TAIL: '你被标记为未到场，并已移至队尾',
     NO_SHOW_REMOVED: '你被标记为未到场，登记已被移除',
     TEMPORARY_AWAY_EXPIRED: '暂时离开已达到轮空上限，登记已退出排队',
+    ONLINE_REGISTRATION_ADDED: '线上登记已经创建，请按时到现场签到',
+    ONLINE_CHECK_IN_COMPLETED: '你已完成现场签到',
+    ONLINE_CHECK_IN_TIMED_OUT: '超过 30 分钟未签到，登记已退出排队',
+    ONLINE_CHECK_IN_MISSED: '轮到进入游玩位置时未签到，登记已退出排队',
     REGISTRATION_REMOVED: '这份登记已离开队列',
     REGISTRATION_CLOSED: '登记排队已经关闭',
     QUEUE_RESET: '现场已经开始新的队列'
@@ -1042,8 +1060,12 @@ function eventTypeLabel(type) {
     NO_SHOW_DEFERRED: '未到场 · 暂缓一轮',
     NO_SHOW_MOVED_TO_TAIL: '未到场 · 移至队尾',
     NO_SHOW_REMOVED: '未到场 · 移除登记',
-    TEMPORARY_AWAY_EXPIRED: '暂离期满退出',
-    ABSENCE_CHANGED: '暂缓或暂离',
+    TEMPORARY_AWAY_EXPIRED: '暂时离开期满退出',
+    ONLINE_REGISTRATION_ADDED: '线上登记',
+    ONLINE_CHECK_IN_COMPLETED: '现场签到',
+    ONLINE_CHECK_IN_TIMED_OUT: '签到超时',
+    ONLINE_CHECK_IN_MISSED: '轮到时未签到',
+    ABSENCE_CHANGED: '暂缓一轮或暂时离开',
     MACHINE_STOPPED: '机台停止使用',
     MACHINE_RESTORED: '机台恢复使用',
     REGISTRATION_OPENED: '开放登记',
@@ -1159,6 +1181,14 @@ function resetOnlineJoin() {
   onlineJoinQueueId.value = null
   onlineJoinResultDetail.value = ''
   onlineJoinTerminalApplied.value = false
+}
+
+function hasRestartedOnlineCheckInWindow(registration) {
+  const createdAt = registration?.createdAt
+  const startedAt = registration?.onlineCheckInStartedAt
+  return typeof createdAt === 'number' && Number.isFinite(createdAt) &&
+    typeof startedAt === 'number' && Number.isFinite(startedAt) &&
+    startedAt !== createdAt
 }
 
 function openOnlineJoin() {
@@ -1995,7 +2025,10 @@ onBeforeUnmount(() => {
                 </div>
                 <div v-if="selectedDetail.registration.onlineRegistrationPendingCheckIn">
                   <dt>签到规则</dt>
-                  <dd>创建登记后 30 分钟内；轮到时仍未签到也会自动退出</dd>
+                  <dd v-if="hasRestartedOnlineCheckInWindow(selectedDetail.registration)">
+                    机台恢复正常使用后重新获得的 30 分钟内；轮到时仍未签到也会自动退出
+                  </dd>
+                  <dd v-else>创建登记后 30 分钟内；轮到时仍未签到也会自动退出</dd>
                 </div>
                 <div v-if="selectedDetail.estimatedWaitMinutes !== null || selectedDetail.registration.onlineRegistrationPendingCheckIn">
                   <dt>预计游玩</dt>

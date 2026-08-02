@@ -129,8 +129,8 @@ const onlineRegistrationAvailable = computed(() => (
 const onlineRegistrationSummary = computed(() => {
   if (snapshotStale.value) return '队列数据已过期，暂不能线上加入排队'
   if (!hasSnapshot.value || !terminalOnline.value) return '现场终端离线，暂不能线上加入排队'
-  if (capabilities.value?.online_registration !== true) return '现场暂未开放线上登记'
   if (businessHoursClosingGrace.value) return '闭店收尾期间不再接收新的排队登记'
+  if (capabilities.value?.online_registration !== true) return '现场暂未开放线上登记'
   if (registrationOpen.value === false) {
     return outsideBusinessHours.value ? '当前不接收新的排队登记' : '当前采用现场自然排队'
   }
@@ -149,7 +149,8 @@ const onlineJoinMachineOptions = computed(() => {
     operational: machine.operational,
     registrationCount: machine.registrationCount,
     estimatedWaitMinutes: null,
-    available: machine.synced && machine.operational && machine.registrationCount < 20,
+    available: !businessHoursClosingGrace.value && machine.synced &&
+      machine.operational && machine.registrationCount < 20,
     unavailableReason: !machine.operational
       ? '机台已停止使用'
       : machine.registrationCount >= 20 ? '登记已满' : null
@@ -237,7 +238,8 @@ const registrationLocations = computed(() => {
           kind: 'WAITING',
           label: `位置 ${machine.id}${index + 1}`,
           estimate: position.estimatedWaitMinutes,
-          registrations: position.registrations
+          registrations: position.registrations,
+          commonPlayPreview: position.commonPlayPreview
         })
       })
     })
@@ -291,8 +293,13 @@ const markedSelfPartnerText = computed(() => {
   const partners = location.registrations.filter((registration) => (
     registration.registrationId !== location.registration.registrationId
   ))
-  if (!partners.length) return '当前为单人安排'
-  return `将与${partners.map((partner) => `“${partner.displayId}”`).join('、')}共同游玩`
+  if (partners.length) {
+    return `将与${partners.map((partner) => `“${partner.displayId}”`).join('、')}共同游玩`
+  }
+  if (location.commonPlayPreview) {
+    return `预计与“${location.commonPlayPreview.displayId}”共同游玩`
+  }
+  return '当前为单人安排'
 })
 
 const filteredLogs = computed(() => {
@@ -405,7 +412,20 @@ function normalizePosition(source, index) {
       source?.estimated_wait_minutes ?? source?.estimatedWaitMinutes
     ),
     positionId: source?.position_id ?? source?.positionId ?? null,
+    commonPlayPreview: normalizeCommonPlayPreview(
+      source?.common_play_preview ?? source?.commonPlayPreview
+    ),
     index
+  }
+}
+
+function normalizeCommonPlayPreview(source) {
+  if (!source || typeof source !== 'object') return null
+  const displayId = String(source.display_id ?? source.displayId ?? '').trim()
+  if (!displayId) return null
+  return {
+    registrationId: source.registration_id ?? source.registrationId ?? null,
+    displayId
   }
 }
 
@@ -835,7 +855,7 @@ function absenceLabel(registration) {
       ? `暂时离开 · 已轮空 ${registration.temporaryAwaySkippedTurns} 次`
       : '暂时离开'
   }
-  if (registration.deferredOnce) return '暂缓一轮'
+  if (registration.deferredOnce) return '暂缓一次'
   return null
 }
 
@@ -858,9 +878,6 @@ function positionEstimateText(minutes, registrations = [], machine = null) {
   if (snapshotStale.value) return '数据已过期，暂时无法估算'
   if (!terminalOnline.value) return '终端恢复同步后重新估算'
   if (machine?.operational === false) return '机台恢复使用后重新估算'
-  if (registrations.some((registration) => registration.onlineRegistrationPendingCheckIn)) {
-    return '签到后可估算'
-  }
   if (registrations.some((registration) => registration.temporarilyAway)) {
     return '暂时离开，无法估算'
   }
@@ -878,10 +895,24 @@ function preferenceLabel(registration) {
   return registration.preference === 'SOLO' ? '单人游玩' : '允许他人加入'
 }
 
+function registrationPartnerText(detail) {
+  if (!detail || detail.kind !== 'registration') return null
+  const partners = detail.locationRegistrations.filter((registration) => (
+    registration.registrationId !== detail.registration.registrationId
+  ))
+  if (partners.length) {
+    return `将与${partners.map((partner) => `“${partner.displayId}”`).join('、')}共同游玩`
+  }
+  if (detail.commonPlayPreview) {
+    return `预计与“${detail.commonPlayPreview.displayId}”共同游玩`
+  }
+  return null
+}
+
 function noShowResultLabel(registration) {
   if (!registration.noShowCount) return null
   return registration.lastNoShowActionWasDefer
-    ? `未到场 ${registration.noShowCount} 次 · 上次处理：暂缓一轮`
+    ? `未到场 ${registration.noShowCount} 次 · 上次处理：暂缓一次`
     : `未到场 ${registration.noShowCount} 次 · 上次处理：移至队尾`
 }
 
@@ -909,7 +940,8 @@ function openPosition(machine, position = null) {
     isPlaying,
     estimate: isPlaying ? null : position.estimatedWaitMinutes,
     playingText: isPlaying ? playingLabel(machine) : null,
-    positionId: isPlaying ? null : position.positionId
+    positionId: isPlaying ? null : position.positionId,
+    commonPlayPreview: isPlaying ? null : position.commonPlayPreview
   }
 }
 
@@ -918,7 +950,8 @@ function openRegistration(
   registration,
   locationLabel,
   estimatedWaitMinutes = null,
-  locationRegistrations = []
+  locationRegistrations = [],
+  commonPlayPreview = null
 ) {
   selectedDetail.value = {
     kind: 'registration',
@@ -927,6 +960,7 @@ function openRegistration(
     locationLabel,
     estimatedWaitMinutes,
     locationRegistrations,
+    commonPlayPreview,
     registration
   }
 }
@@ -939,7 +973,8 @@ function openRegistrationFromPosition(registration) {
     registration,
     detail.title.replace(' · 固定组合', ''),
     detail.isPlaying ? null : detail.estimate,
-    detail.registrations
+    detail.registrations,
+    detail.commonPlayPreview
   )
 }
 
@@ -960,7 +995,7 @@ function markedSelfStatusTitle() {
   if (!location.machine.operational) return `${location.machine.name} 已停止使用`
   if (registration.onlineRegistrationPendingCheckIn) return '线上登记仍待现场签到'
   if (registration.temporarilyAway) return '你当前处于暂时离开状态'
-  if (registration.deferredOnce) return '你已暂缓一轮'
+  if (registration.deferredOnce) return '你已暂缓一次'
   if (location.kind === 'PLAYING') return '现在轮到你游玩'
   return positionEstimateText(location.estimate, location.registrations, location.machine)
 }
@@ -1035,7 +1070,7 @@ function markedSelfTone() {
 
 function eventOutcomeTitle(event) {
   const labels = {
-    NO_SHOW_DEFERRED: '你被标记为未到场，并已暂缓一轮',
+    NO_SHOW_DEFERRED: '你被标记为未到场，并已暂缓一次',
     NO_SHOW_MOVED_TO_TAIL: '你被标记为未到场，并已移至队尾',
     NO_SHOW_REMOVED: '你被标记为未到场，登记已被移除',
     TEMPORARY_AWAY_EXPIRED: '暂时离开已达到轮空上限，登记已退出排队',
@@ -1057,7 +1092,7 @@ function eventTypeLabel(type) {
     REGISTRATION_UPDATED: '登记变动',
     QUEUE_REORDERED: '顺序调整',
     PLAYING_CHANGED: '游玩位置',
-    NO_SHOW_DEFERRED: '未到场 · 暂缓一轮',
+    NO_SHOW_DEFERRED: '未到场 · 暂缓一次',
     NO_SHOW_MOVED_TO_TAIL: '未到场 · 移至队尾',
     NO_SHOW_REMOVED: '未到场 · 移除登记',
     TEMPORARY_AWAY_EXPIRED: '暂时离开期满退出',
@@ -1065,7 +1100,7 @@ function eventTypeLabel(type) {
     ONLINE_CHECK_IN_COMPLETED: '现场签到',
     ONLINE_CHECK_IN_TIMED_OUT: '签到超时',
     ONLINE_CHECK_IN_MISSED: '轮到时未签到',
-    ABSENCE_CHANGED: '暂缓一轮或暂时离开',
+    ABSENCE_CHANGED: '暂缓一次或暂时离开',
     MACHINE_STOPPED: '机台停止使用',
     MACHINE_RESTORED: '机台恢复使用',
     REGISTRATION_OPENED: '开放登记',
@@ -1710,13 +1745,17 @@ onBeforeUnmount(() => {
                     class="queue-registration"
                     :class="[`is-${registrationTone(registration)}`, { 'is-self': isMarkedRegistration(registration) }]"
                     type="button"
-                    @click.stop="openRegistration(machine, registration, `位置 ${machine.id}${index + 1}`, position.estimatedWaitMinutes, position.registrations)"
+                    @click.stop="openRegistration(machine, registration, `位置 ${machine.id}${index + 1}`, position.estimatedWaitMinutes, position.registrations, position.commonPlayPreview)"
                   >
                     <strong>{{ registration.displayId }}</strong>
                     <span>{{ registrationLabel(registration) }}</span>
                     <UserRoundCheck v-if="isMarkedRegistration(registration)" :size="14" aria-label="我的登记" />
                     <ChevronRight v-else :size="15" aria-hidden="true" />
                   </button>
+                  <div v-if="position.commonPlayPreview" class="queue-registration is-preview">
+                    <strong>{{ position.commonPlayPreview.displayId }}</strong>
+                    <span>共同游玩预览</span>
+                  </div>
                 </div>
               </article>
             </div>
@@ -1978,9 +2017,10 @@ onBeforeUnmount(() => {
                   ) }}
                 </span>
                 <span v-if="selectedDetail.registrations.some((registration) => registration.temporarilyAway)" class="is-absence">包含暂时离开</span>
-                <span v-if="selectedDetail.registrations.some((registration) => registration.deferredOnce)" class="is-absence">包含暂缓一轮</span>
+                <span v-if="selectedDetail.registrations.some((registration) => registration.deferredOnce)" class="is-absence">包含暂缓一次</span>
                 <span v-if="selectedDetail.registrations.some((registration) => registration.noShowCount > 0)" class="is-warning">包含未到场记录</span>
                 <span v-if="selectedDetail.registrations.some((registration) => registration.onlineRegistrationPendingCheckIn)" class="is-online">包含待签到登记</span>
+                <span v-if="selectedDetail.commonPlayPreview">预计与“{{ selectedDetail.commonPlayPreview.displayId }}”共同游玩</span>
               </div>
               <div class="queue-detail-registration-list">
                 <button v-for="registration in selectedDetail.registrations"
@@ -1994,6 +2034,12 @@ onBeforeUnmount(() => {
                   <UserRoundCheck v-if="isMarkedRegistration(registration)" :size="16" aria-label="我的登记" />
                   <ChevronRight v-else :size="17" aria-hidden="true" />
                 </button>
+                <div v-if="selectedDetail.commonPlayPreview" class="queue-detail-preview">
+                  <span>
+                    <strong>{{ selectedDetail.commonPlayPreview.displayId }}</strong>
+                    <small>共同游玩预览</small>
+                  </span>
+                </div>
               </div>
             </template>
 
@@ -2006,6 +2052,9 @@ onBeforeUnmount(() => {
                   {{ absenceLabel(selectedDetail.registration) || preferenceLabel(selectedDetail.registration) }}
                 </span>
                 <span>{{ registrationTypeLabel(selectedDetail.registration) }}</span>
+                <span v-if="registrationPartnerText(selectedDetail)">
+                  {{ registrationPartnerText(selectedDetail) }}
+                </span>
                 <span v-if="selectedDetail.registration.noShowCount > 0" class="is-warning">
                   未到场 {{ selectedDetail.registration.noShowCount }} 次
                 </span>
@@ -2251,6 +2300,10 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-registration.is-absence { background: color-mix(in srgb, var(--queue-soft-orange) 72%, var(--queue-card)); }
 .queue-registration.is-warning { border-color: color-mix(in srgb, var(--queue-red) 22%, transparent); background: color-mix(in srgb, var(--queue-soft-red) 72%, var(--queue-card)); }
 .queue-registration.is-online { border-color: color-mix(in srgb, var(--queue-online) 22%, transparent); background: color-mix(in srgb, var(--queue-soft-online) 76%, var(--queue-card)); }
+.queue-registration.is-preview { padding-right: 10px; color: var(--queue-secondary); border-color: color-mix(in srgb, var(--queue-tertiary) 18%, transparent); background: var(--queue-disabled); cursor: default; }
+.queue-registration.is-preview:hover { background: var(--queue-disabled); }
+.queue-registration.is-preview:active { transform: none; }
+.queue-registration.is-preview span { color: var(--queue-tertiary); }
 .queue-registration.is-self { border-color: color-mix(in srgb, var(--queue-blue) 54%, var(--queue-separator)); }
 .queue-registration > svg { position: absolute; top: 50%; right: 8px; color: var(--queue-tertiary); transform: translateY(-50%); }
 .queue-registration.is-self > svg { color: var(--queue-blue); }
@@ -2305,6 +2358,10 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-detail-pills span.is-online { color: var(--queue-online); background: var(--queue-soft-online); }
 .queue-detail-registration-list { display: grid; margin-top: 16px; gap: 8px; }
 .queue-detail-registration-list button { display: flex; min-width: 0; min-height: 54px; padding: 10px 12px; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--queue-separator); border-radius: 9px; color: var(--queue-text); background: var(--queue-position); text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .12s ease; }
+.queue-detail-preview { display: flex; min-width: 0; min-height: 54px; padding: 10px 12px; align-items: center; border: 1px solid color-mix(in srgb, var(--queue-tertiary) 18%, transparent); border-radius: 9px; color: var(--queue-secondary); background: var(--queue-disabled); }
+.queue-detail-preview span, .queue-detail-preview strong, .queue-detail-preview small { display: block; min-width: 0; }
+.queue-detail-preview strong { overflow: hidden; font-size: 12px; font-weight: 570; text-overflow: ellipsis; white-space: nowrap; }
+.queue-detail-preview small { margin-top: 3px; color: var(--queue-tertiary); font-size: 9px; }
 .queue-detail-registration-list button:active { transform: scale(.99); }
 .queue-detail-registration-list button.is-absence { border-color: color-mix(in srgb, var(--queue-orange) 18%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-orange) 72%, var(--queue-position)); }
 .queue-detail-registration-list button.is-warning { border-color: color-mix(in srgb, var(--queue-red) 18%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-red) 72%, var(--queue-position)); }

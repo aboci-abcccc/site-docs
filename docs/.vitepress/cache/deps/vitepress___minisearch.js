@@ -1,4 +1,4 @@
-import "./chunk-5Z66FT5C.js";
+import "./chunk-XGM4GKIC.js";
 
 // node_modules/.pnpm/minisearch@7.2.0/node_modules/minisearch/dist/es/index.js
 var ENTRIES = "ENTRIES";

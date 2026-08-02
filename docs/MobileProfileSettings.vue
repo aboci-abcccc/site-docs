@@ -9,7 +9,7 @@ const emit = defineEmits(['change'])
 const notificationOptions = [
   ['notify_queue_changes', '队列状态变化'],
   ['notify_online_check_in', '线上登记与签到'],
-  ['notify_absence', '暂缓一轮、暂时离开和未到场'],
+  ['notify_absence', '暂缓一次、暂时离开和未到场'],
   ['notify_playing_position', '游玩位置变化'],
   ['notify_machine_status', '机台及营业状态']
 ]

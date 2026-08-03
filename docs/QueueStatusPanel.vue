@@ -749,7 +749,8 @@ function reconcileSelectedDetail() {
       location.registration,
       location.label,
       location.kind === 'PLAYING' ? null : location.estimate,
-      location.registrations
+      location.registrations,
+      location.commonPlayPreview
     )
     return
   }
@@ -1044,7 +1045,7 @@ function markedSelfStatusDetail() {
       ? `排队时会暂时忽略这份登记，目前已轮空 ${skipped} 次；第四次轮到时仍未解除，将退出排队。`
       : '排队时会暂时忽略这份登记。需要在终端手动解除，才能再次进入游玩位置。'
   }
-  if (registration.deferredOnce) return '本次进入游玩位置的机会会被跳过，轮到下一组时将自动解除。'
+  if (registration.deferredOnce) return '这份登记原本的本次游玩机会会被跳过，并在该机会处理完成后自动解除。'
   if (location.kind === 'PLAYING') return markedSelfPartnerText.value
   return markedSelfPartnerText.value
 }

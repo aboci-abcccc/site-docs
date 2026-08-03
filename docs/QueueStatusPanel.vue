@@ -1418,17 +1418,16 @@ async function pollOnlineJoinCommand() {
     }
     if (command.status === 'APPLIED') {
       onlineJoinTerminalApplied.value = true
-      await loadQueue(true)
-      if (commandId !== onlineJoinCommandId.value) return
       const appliedLocation = findAppliedOnlineRegistration(command)
-      if (!appliedLocation) {
-        scheduleOnlineCommandPoll()
-        return
-      }
+      const resultRegistrationId = command?.result_registration_id ?? command?.resultRegistrationId
       onlineJoinResultDetail.value = command.result_detail || '线上登记已经加入等待顺序。'
       onlineJoinStep.value = 'SUCCESS'
-      markOnlinePlayerAsSelf(appliedLocation.registration, false)
+      markOnlinePlayerAsSelf(
+        appliedLocation?.registration || { registrationId: resultRegistrationId || '' },
+        false
+      )
       onlineJoinCommandId.value = null
+      loadQueue(true)
       return
     }
     onlineJoinTerminalApplied.value = false
@@ -1963,7 +1962,7 @@ onBeforeUnmount(() => {
               </span>
               <strong>{{ onlineJoinTerminalApplied ? '终端已保存，正在同步队列' : '正在等待现场终端确认' }}</strong>
               <p>{{ onlineJoinTerminalApplied
-                ? '正在核对最新队列位置，确认登记显示后才会完成。'
+                ? '终端已确认创建，正在刷新最新队列位置。'
                 : '请保持页面打开。终端处理完成后，这里会显示最终结果；重复点击不会建立多份登记。' }}</p>
               <p v-if="!onlineJoinProfile?.setupComplete">终端确认创建后，到场时须先补全玩家资料，才能签到。</p>
               <button class="queue-online-secondary" type="button" @click="closeOnlineJoin">在后台等待</button>

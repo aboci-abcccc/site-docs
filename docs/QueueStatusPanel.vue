@@ -90,6 +90,7 @@ const onlineJoinError = ref('')
 const onlineJoinCommandId = ref(null)
 const onlineJoinQueueId = ref(null)
 const onlineJoinResultDetail = ref('')
+const onlineJoinResultRegistrationId = ref(null)
 const onlineJoinTerminalApplied = ref(false)
 const mobileRegistrationToken = ref('')
 let refreshTimer
@@ -294,12 +295,47 @@ const markedSelfPartnerText = computed(() => {
     registration.registrationId !== location.registration.registrationId
   ))
   if (partners.length) {
-    return `将与${partners.map((partner) => `“${partner.displayId}”`).join('、')}共同游玩`
+    const action = location.kind === 'PLAYING' ? '正在与' : '将与'
+    return `${action}${partners.map((partner) => `“${partner.displayId}”`).join('、')}共同游玩`
   }
   if (location.commonPlayPreview) {
     return `预计与“${location.commonPlayPreview.displayId}”共同游玩`
   }
   return '当前为单人安排'
+})
+
+const onlineJoinPostApplyEvent = computed(() => {
+  const registrationId = onlineJoinResultRegistrationId.value
+  if (!registrationId) return null
+  if (
+    onlineJoinQueueId.value && queueId.value &&
+    onlineJoinQueueId.value !== queueId.value
+  ) {
+    return {
+      type: 'QUEUE_RESET',
+      title: '现场已经开始新的队列',
+      detail: '现场已开始新的排队批次，这份线上登记不再有效。',
+      registrationIds: [registrationId]
+    }
+  }
+  if (registrationLocations.value.some(({ registration }) => (
+    registration.registrationId === registrationId
+  ))) return null
+  const terminalExitTypes = new Set([
+    'ONLINE_CHECK_IN_TIMED_OUT',
+    'ONLINE_CHECK_IN_MISSED',
+    'REGISTRATION_REMOVED',
+    'REGISTRATION_CLOSED',
+    'QUEUE_RESET'
+  ])
+  return [...markedSelfLogs.value, ...currentLogs.value]
+    .filter((event, index, events) => (
+      events.findIndex((candidate) => candidate.eventId === event.eventId) === index
+    ))
+    .sort((first, second) => (second.cursor || 0) - (first.cursor || 0))
+    .find((event) => (
+      terminalExitTypes.has(event.type) && event.registrationIds.includes(registrationId)
+    )) || null
 })
 
 const filteredLogs = computed(() => {
@@ -750,7 +786,8 @@ function reconcileSelectedDetail() {
       location.label,
       location.kind === 'PLAYING' ? null : location.estimate,
       location.registrations,
-      location.commonPlayPreview
+      location.commonPlayPreview,
+      location.kind === 'PLAYING'
     )
     return
   }
@@ -902,7 +939,8 @@ function registrationPartnerText(detail) {
     registration.registrationId !== detail.registration.registrationId
   ))
   if (partners.length) {
-    return `将与${partners.map((partner) => `“${partner.displayId}”`).join('、')}共同游玩`
+    const action = detail.isPlaying ? '正在与' : '将与'
+    return `${action}${partners.map((partner) => `“${partner.displayId}”`).join('、')}共同游玩`
   }
   if (detail.commonPlayPreview) {
     return `预计与“${detail.commonPlayPreview.displayId}”共同游玩`
@@ -952,7 +990,8 @@ function openRegistration(
   locationLabel,
   estimatedWaitMinutes = null,
   locationRegistrations = [],
-  commonPlayPreview = null
+  commonPlayPreview = null,
+  isPlaying = false
 ) {
   selectedDetail.value = {
     kind: 'registration',
@@ -962,6 +1001,7 @@ function openRegistration(
     estimatedWaitMinutes,
     locationRegistrations,
     commonPlayPreview,
+    isPlaying,
     registration
   }
 }
@@ -975,7 +1015,8 @@ function openRegistrationFromPosition(registration) {
     detail.title.replace(' · 固定组合', ''),
     detail.isPlaying ? null : detail.estimate,
     detail.registrations,
-    detail.commonPlayPreview
+    detail.commonPlayPreview,
+    detail.isPlaying
   )
 }
 
@@ -1216,6 +1257,7 @@ function resetOnlineJoin() {
   onlineJoinCommandId.value = null
   onlineJoinQueueId.value = null
   onlineJoinResultDetail.value = ''
+  onlineJoinResultRegistrationId.value = null
   onlineJoinTerminalApplied.value = false
 }
 
@@ -1306,6 +1348,7 @@ function backToOnlineLookup() {
   onlineJoinExistingRegistration.value = null
   onlineJoinPreference.value = null
   onlineJoinCommandId.value = null
+  onlineJoinResultRegistrationId.value = null
   onlineJoinTerminalApplied.value = false
   onlineJoinError.value = ''
 }
@@ -1420,6 +1463,7 @@ async function pollOnlineJoinCommand() {
       onlineJoinTerminalApplied.value = true
       const appliedLocation = findAppliedOnlineRegistration(command)
       const resultRegistrationId = command?.result_registration_id ?? command?.resultRegistrationId
+      onlineJoinResultRegistrationId.value = resultRegistrationId || null
       onlineJoinResultDetail.value = command.result_detail || '线上登记已经加入等待顺序。'
       onlineJoinStep.value = 'SUCCESS'
       markOnlinePlayerAsSelf(
@@ -1431,6 +1475,7 @@ async function pollOnlineJoinCommand() {
       return
     }
     onlineJoinTerminalApplied.value = false
+    onlineJoinResultRegistrationId.value = null
     onlineJoinResultDetail.value = command.result_detail || '现场终端没有执行这次线上登记。'
     onlineJoinCommandId.value = null
     onlineJoinStep.value = 'REJECTED'
@@ -1711,7 +1756,7 @@ onBeforeUnmount(() => {
                     class="queue-registration"
                     :class="[`is-${registrationTone(registration)}`, { 'is-self': isMarkedRegistration(registration) }]"
                     type="button"
-                    @click.stop="openRegistration(machine, registration, `游玩位置 ${machine.id}`, null, machine.playing)"
+                    @click.stop="openRegistration(machine, registration, `游玩位置 ${machine.id}`, null, machine.playing, null, true)"
                   >
                     <strong>{{ registration.displayId }}</strong>
                     <span>{{ registrationLabel(registration) }}</span>
@@ -1975,11 +2020,14 @@ onBeforeUnmount(() => {
               <button class="queue-online-primary" type="button" @click="backToOnlineLookup">重新查询</button>
             </div>
 
-            <div v-else class="queue-online-result is-success" aria-live="polite">
-              <span class="queue-online-result-icon" aria-hidden="true"><CircleCheck :size="24" /></span>
-              <strong>已加入等待顺序</strong>
-              <p>{{ onlineJoinResultDetail }}</p>
-              <div class="queue-online-check-in-notice">
+            <div v-else class="queue-online-result" :class="onlineJoinPostApplyEvent ? 'is-rejected' : 'is-success'" aria-live="polite">
+              <span class="queue-online-result-icon" aria-hidden="true">
+                <TriangleAlert v-if="onlineJoinPostApplyEvent" :size="23" />
+                <CircleCheck v-else :size="24" />
+              </span>
+              <strong>{{ onlineJoinPostApplyEvent ? eventOutcomeTitle(onlineJoinPostApplyEvent) : '已加入等待顺序' }}</strong>
+              <p>{{ onlineJoinPostApplyEvent?.detail || onlineJoinResultDetail }}</p>
+              <div v-if="!onlineJoinPostApplyEvent" class="queue-online-check-in-notice">
                 <TriangleAlert :size="18" aria-hidden="true" />
                 <p>
                   <strong>须在 30 分钟内完成签到</strong>

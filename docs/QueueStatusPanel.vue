@@ -30,7 +30,8 @@ const ONLINE_COMMAND_POLL_INTERVAL = 1500
 const SELF_STORAGE_KEY = 'maimai-q:marked-registration:v1'
 const MAX_SELF_REGISTRATION_HISTORY = 24
 
-const machineDefinitions = [
+const SUPPORTED_MACHINE_IDS = ['A', 'B', 'C', 'D']
+const defaultMachineDefinitions = [
   { id: 'A', name: '左侧 · 机台 A' },
   { id: 'B', name: '右侧 · 机台 B' }
 ]
@@ -43,7 +44,7 @@ const logSourceDefinitions = [
   { value: 'MOBILE_DEVICE', label: '移动设备' }
 ]
 
-const machines = ref(machineDefinitions.map(createEmptyMachine))
+const machines = ref(defaultMachineDefinitions.map(createEmptyMachine))
 const registrationOpen = ref(null)
 const businessHours = ref({
   enabled: false,
@@ -99,6 +100,12 @@ let onlineCommandTimer
 
 const totalRegistrationCount = computed(() => (
   machines.value.reduce((total, machine) => total + machine.registrationCount, 0)
+))
+
+const machineCountSummary = computed(() => (
+  machines.value.length === 1
+    ? '当前使用 1 台机台'
+    : `${machines.value.length} 台机台的登记顺序彼此独立`
 ))
 
 const snapshotAgeMillis = computed(() => {
@@ -349,6 +356,15 @@ const filteredLogs = computed(() => {
     : machineFiltered.filter((event) => event.operationSource === logSourceFilter.value)
 })
 
+const logMachineFilters = computed(() => [
+  { value: 'ALL', label: '全部' },
+  ...machines.value.map((machine) => ({
+    value: machine.id,
+    label: `机台 ${machine.id}`
+  })),
+  { value: 'SYSTEM', label: '系统' }
+])
+
 function createEmptyMachine(definition) {
   return {
     ...definition,
@@ -502,6 +518,37 @@ function machineSource(sources, definition) {
   return sources?.[definition.id] ?? sources?.[definition.id.toLowerCase()]
 }
 
+function machineDefinitionsFromSources(sources) {
+  const sourceById = new Map()
+  const entries = Array.isArray(sources)
+    ? sources.map((source) => [source?.id ?? source?.machine_id, source])
+    : Object.entries(sources)
+  entries.forEach(([sourceId, source]) => {
+    const id = String(sourceId || '').toUpperCase()
+    if (!SUPPORTED_MACHINE_IDS.includes(id) || sourceById.has(id)) {
+      throw new Error('Invalid machine configuration')
+    }
+    sourceById.set(id, source)
+  })
+
+  const configuredIds = SUPPORTED_MACHINE_IDS.slice(0, sourceById.size)
+  if (
+    !sourceById.size ||
+    sourceById.size > SUPPORTED_MACHINE_IDS.length ||
+    !configuredIds.every((id) => sourceById.has(id))
+  ) {
+    throw new Error('Invalid machine configuration')
+  }
+
+  return configuredIds.map((id) => ({
+    definition: defaultMachineDefinitions.find((definition) => definition.id === id) || {
+      id,
+      name: `机台 ${id}`
+    },
+    source: sourceById.get(id)
+  }))
+}
+
 function normalizeBusinessHours(source) {
   if (!source || typeof source !== 'object') {
     return {
@@ -536,9 +583,19 @@ function applyServerData(data) {
     currentLogsQueueId.value = null
     currentLogsNextCursor.value = null
   }
-  machines.value = machineDefinitions.map((definition) => (
-    normalizeMachine(definition, machineSource(sources, definition))
+  const normalizedMachines = machineDefinitionsFromSources(sources).map(({ definition, source }) => (
+    normalizeMachine(definition, source)
   ))
+  machines.value = normalizedMachines
+  const machineIds = new Set(normalizedMachines.map((machine) => machine.id))
+  if (!['ALL', 'SYSTEM'].includes(logFilter.value) && !machineIds.has(logFilter.value)) {
+    logFilter.value = 'ALL'
+  }
+  if (!machineIds.has(onlineJoinMachineId.value)) {
+    onlineJoinMachineId.value = normalizedMachines.find((machine) => (
+      machine.synced && machine.operational && machine.registrationCount < 20
+    ))?.id || normalizedMachines[0].id
+  }
   registrationOpen.value = data?.registration_open ?? data?.registrationOpen ?? true
   businessHours.value = normalizeBusinessHours(data?.business_hours ?? data?.businessHours)
   terminal.value = data?.terminal ?? { online: true }
@@ -1239,7 +1296,8 @@ async function readJsonResponse(response) {
 }
 
 function firstAvailableOnlineMachineId() {
-  return onlineJoinMachineOptions.value.find((machine) => machine.available)?.id || 'A'
+  return onlineJoinMachineOptions.value.find((machine) => machine.available)?.id ||
+    onlineJoinMachineOptions.value[0]?.id || machines.value[0]?.id || 'A'
 }
 
 function resetOnlineJoin() {
@@ -1326,8 +1384,15 @@ async function queryOnlineProfile() {
     onlineJoinProfile.value = profile
     onlineJoinQueueId.value = data.queue_id ?? data.queueId ?? queueId.value
     onlineJoinMachines.value = Array.isArray(data.machines)
-      ? data.machines.map(normalizeOnlineMachine).filter((machine) => machine.id)
+      ? data.machines.map(normalizeOnlineMachine)
+        .filter((machine) => SUPPORTED_MACHINE_IDS.includes(machine.id))
+        .sort((first, second) => (
+          SUPPORTED_MACHINE_IDS.indexOf(first.id) - SUPPORTED_MACHINE_IDS.indexOf(second.id)
+        ))
       : []
+    if (!onlineJoinMachines.value.some((machine) => machine.id === onlineJoinMachineId.value)) {
+      onlineJoinMachineId.value = firstAvailableOnlineMachineId()
+    }
     onlineJoinExistingRegistration.value = data.existing_registration ??
       data.existingRegistration ?? null
     onlineJoinPreference.value = profile.defaultPreference === 'ASK_EVERY_TIME'
@@ -1571,7 +1636,7 @@ onBeforeUnmount(() => {
       <div class="queue-heading">
         <h1>排队登记</h1>
         <p>
-          <span>两台机台的登记顺序彼此独立</span>
+          <span>{{ machineCountSummary }}</span>
           <template v-if="hasSnapshot">
             <span class="queue-heading-separator" aria-hidden="true">·</span>
             <strong>当前共 {{ totalRegistrationCount }} 个登记</strong>
@@ -1667,7 +1732,7 @@ onBeforeUnmount(() => {
       <span class="queue-unavailable-icon" aria-hidden="true"><WifiOff :size="22" /></span>
       <div>
         <h2>{{ loading ? '正在读取现场队列' : '排队终端暂未接入' }}</h2>
-        <p>{{ loading ? '正在等待终端返回最新登记状态。' : '终端完成联网同步后，这里会显示两台机台的实时登记顺序。' }}</p>
+        <p>{{ loading ? '正在等待终端返回最新登记状态。' : '终端完成联网同步后，这里会显示现场机台的实时登记顺序。' }}</p>
       </div>
     </section>
 
@@ -1817,9 +1882,9 @@ onBeforeUnmount(() => {
         </div>
         <div class="queue-log-filter-groups">
           <div class="queue-log-filters" aria-label="按范围筛选日志">
-            <button v-for="filter in ['ALL', 'A', 'B', 'SYSTEM']" :key="filter" type="button"
-              :class="{ active: logFilter === filter }" @click="logFilter = filter">
-              {{ filter === 'ALL' ? '全部' : filter === 'SYSTEM' ? '系统' : `机台 ${filter}` }}
+            <button v-for="filter in logMachineFilters" :key="filter.value" type="button"
+              :class="{ active: logFilter === filter.value }" @click="logFilter = filter.value">
+              {{ filter.label }}
             </button>
           </div>
           <div class="queue-log-filters" aria-label="按操作来源筛选日志">
@@ -2316,6 +2381,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 
 .queue-machine-list { display: grid; gap: 16px; }
 .queue-machine { min-width: 0; padding: 17px; border: 1px solid color-mix(in srgb, var(--queue-separator) 74%, transparent); border-radius: 14px; background: var(--queue-card); }
+.queue-machine:only-child { grid-column: 1 / -1; }
 .queue-machine-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .queue-machine-header > div { min-width: 0; }
 .queue-machine-header h2 { margin: 0; border: 0; font-size: 19px; font-weight: 620; line-height: 1.35; letter-spacing: 0; }

@@ -14,6 +14,12 @@ import {
 } from '@lucide/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import MobileRegistrationFlow from './MobileRegistrationFlow.vue'
+import {
+  machineGameTypeName,
+  machineServerName,
+  machineSupportsServer,
+  normalizeMachineConfiguration
+} from './machineConfiguration.js'
 
 const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL || 'https://abcccc.top/api/queue-status'
 const QUEUE_LOG_API_URL = import.meta.env.VITE_QUEUE_LOG_API_URL ||
@@ -59,12 +65,14 @@ const capabilities = ref({})
 const testData = ref(false)
 const capturedAt = ref(null)
 const queueId = ref(null)
+const machineConfigurationRevision = ref(1)
 const hasSnapshot = ref(false)
 const loading = ref(true)
 const refreshing = ref(false)
 const loadError = ref(false)
 const activeView = ref('queue')
 const selectedDetail = ref(null)
+const selectedMachineDetail = ref(null)
 const pendingSelfRegistration = ref(null)
 const markedSelf = ref(null)
 const currentLogs = ref([])
@@ -90,6 +98,7 @@ const onlineJoinLoading = ref(false)
 const onlineJoinError = ref('')
 const onlineJoinCommandId = ref(null)
 const onlineJoinQueueId = ref(null)
+const onlineJoinMachineConfigurationRevision = ref(null)
 const onlineJoinResultDetail = ref('')
 const onlineJoinResultRegistrationId = ref(null)
 const onlineJoinTerminalApplied = ref(false)
@@ -154,6 +163,8 @@ const onlineJoinMachineOptions = computed(() => {
   return machines.value.map((machine) => ({
     id: machine.id,
     name: machine.name,
+    configuration: machine.configuration,
+    capacity: machine.capacity,
     operational: machine.operational,
     registrationCount: machine.registrationCount,
     estimatedWaitMinutes: null,
@@ -169,7 +180,12 @@ const selectedOnlineJoinMachine = computed(() => (
   onlineJoinMachineOptions.value.find((machine) => machine.id === onlineJoinMachineId.value) || null
 ))
 
+const onlineJoinSinglePlayerMachine = computed(() => (
+  selectedOnlineJoinMachine.value?.capacity === 1
+))
+
 const onlineJoinNeedsPreference = computed(() => (
+  !onlineJoinSinglePlayerMachine.value &&
   onlineJoinProfile.value?.defaultPreference === 'ASK_EVERY_TIME'
 ))
 
@@ -366,8 +382,12 @@ const logMachineFilters = computed(() => [
 ])
 
 function createEmptyMachine(definition) {
+  const configuration = normalizeMachineConfiguration(null, definition)
   return {
     ...definition,
+    remark: configuration.remark,
+    configuration,
+    capacity: configuration.capacity,
     synced: false,
     operational: true,
     stopReason: null,
@@ -483,6 +503,7 @@ function normalizeCommonPlayPreview(source) {
 
 function normalizeMachine(definition, source) {
   if (!source || typeof source !== 'object') return createEmptyMachine(definition)
+  const configuration = normalizeMachineConfiguration(source, definition)
   const playingSource = Array.isArray(source.playing)
     ? source.playing
     : source.playing?.registrations
@@ -495,6 +516,9 @@ function normalizeMachine(definition, source) {
   return {
     ...definition,
     name: source.name || definition.name,
+    remark: configuration.remark,
+    configuration,
+    capacity: configuration.capacity,
     synced: true,
     operational: source.operational !== false,
     stopReason: source.stop_reason ?? source.stopReason ?? null,
@@ -577,6 +601,12 @@ function applyServerData(data) {
 
   const previousQueueId = queueId.value
   const nextQueueId = data?.queue_id ?? data?.queueId ?? null
+  const nextMachineConfigurationRevision = Math.max(
+    1,
+    toNonNegativeInteger(
+      data?.machine_configuration_revision ?? data?.machineConfigurationRevision
+    ) || 1
+  )
   if (previousQueueId && nextQueueId && previousQueueId !== nextQueueId) {
     selectedDetail.value = null
     currentLogs.value = []
@@ -586,7 +616,25 @@ function applyServerData(data) {
   const normalizedMachines = machineDefinitionsFromSources(sources).map(({ definition, source }) => (
     normalizeMachine(definition, source)
   ))
+  if (
+    ['CONFIRM', 'EXISTING'].includes(onlineJoinStep.value) &&
+    (
+      (onlineJoinQueueId.value && nextQueueId !== onlineJoinQueueId.value) ||
+      (
+        onlineJoinMachineConfigurationRevision.value &&
+        nextMachineConfigurationRevision !== onlineJoinMachineConfigurationRevision.value
+      )
+    )
+  ) {
+    invalidateOnlineJoinConfirmation('现场队列或机台配置已更新，请重新查询玩家资料后再提交。')
+  }
   machines.value = normalizedMachines
+  machineConfigurationRevision.value = nextMachineConfigurationRevision
+  if (selectedMachineDetail.value) {
+    selectedMachineDetail.value = normalizedMachines.find(
+      (machine) => machine.id === selectedMachineDetail.value.id
+    ) || null
+  }
   const machineIds = new Set(normalizedMachines.map((machine) => machine.id))
   if (!['ALL', 'SYSTEM'].includes(logFilter.value) && !machineIds.has(logFilter.value)) {
     logFilter.value = 'ALL'
@@ -1041,6 +1089,14 @@ function openPosition(machine, position = null) {
   }
 }
 
+function openMachineDetails(machine) {
+  selectedMachineDetail.value = machine
+}
+
+function closeMachineDetails() {
+  selectedMachineDetail.value = null
+}
+
 function openRegistration(
   machine,
   registration,
@@ -1246,6 +1302,8 @@ function createRequestId() {
 
 function normalizeOnlineMachine(source) {
   const id = String(source?.id || '').toUpperCase()
+  const name = String(source?.name || `机台 ${id}`)
+  const configuration = normalizeMachineConfiguration(source, { id, name })
   const registrationCount = toNonNegativeInteger(
     source?.registration_count ?? source?.registrationCount
   ) ?? 0
@@ -1253,7 +1311,9 @@ function normalizeOnlineMachine(source) {
   const available = source?.available === true && operational && registrationCount < 20
   return {
     id,
-    name: String(source?.name || `机台 ${id}`),
+    name,
+    configuration,
+    capacity: configuration.capacity,
     operational,
     registrationCount,
     estimatedWaitMinutes: toNonNegativeInteger(
@@ -1314,9 +1374,25 @@ function resetOnlineJoin() {
   onlineJoinError.value = ''
   onlineJoinCommandId.value = null
   onlineJoinQueueId.value = null
+  onlineJoinMachineConfigurationRevision.value = null
   onlineJoinResultDetail.value = ''
   onlineJoinResultRegistrationId.value = null
   onlineJoinTerminalApplied.value = false
+}
+
+function invalidateOnlineJoinConfirmation(message) {
+  if (!['CONFIRM', 'EXISTING'].includes(onlineJoinStep.value)) return
+  onlineJoinStep.value = 'LOOKUP'
+  onlineJoinProfile.value = null
+  onlineJoinMachines.value = []
+  onlineJoinExistingRegistration.value = null
+  onlineJoinPreference.value = null
+  onlineJoinCommandId.value = null
+  onlineJoinQueueId.value = null
+  onlineJoinMachineConfigurationRevision.value = null
+  onlineJoinResultRegistrationId.value = null
+  onlineJoinTerminalApplied.value = false
+  onlineJoinError.value = message
 }
 
 function hasRestartedOnlineCheckInWindow(registration) {
@@ -1345,6 +1421,11 @@ function handleOnlineJoinQqInput(event) {
 function selectOnlineJoinMachine(machine) {
   if (!machine.available || onlineJoinLoading.value) return
   onlineJoinMachineId.value = machine.id
+  onlineJoinPreference.value = machine.capacity === 1
+    ? 'SOLO'
+    : onlineJoinProfile.value?.defaultPreference === 'ASK_EVERY_TIME'
+      ? null
+      : onlineJoinProfile.value?.defaultPreference || null
   onlineJoinCommandId.value = null
   onlineJoinError.value = ''
 }
@@ -1383,6 +1464,12 @@ async function queryOnlineProfile() {
     if (!profile) throw new Error('服务器返回的玩家资料不完整，请在现场终端检查资料。')
     onlineJoinProfile.value = profile
     onlineJoinQueueId.value = data.queue_id ?? data.queueId ?? queueId.value
+    onlineJoinMachineConfigurationRevision.value = Math.max(
+      1,
+      toNonNegativeInteger(
+        data.machine_configuration_revision ?? data.machineConfigurationRevision
+      ) || machineConfigurationRevision.value
+    )
     onlineJoinMachines.value = Array.isArray(data.machines)
       ? data.machines.map(normalizeOnlineMachine)
         .filter((machine) => SUPPORTED_MACHINE_IDS.includes(machine.id))
@@ -1395,9 +1482,11 @@ async function queryOnlineProfile() {
     }
     onlineJoinExistingRegistration.value = data.existing_registration ??
       data.existingRegistration ?? null
-    onlineJoinPreference.value = profile.defaultPreference === 'ASK_EVERY_TIME'
-      ? null
-      : profile.defaultPreference
+    onlineJoinPreference.value = selectedOnlineJoinMachine.value?.capacity === 1
+      ? 'SOLO'
+      : profile.defaultPreference === 'ASK_EVERY_TIME'
+        ? null
+        : profile.defaultPreference
     onlineJoinStep.value = onlineJoinExistingRegistration.value ? 'EXISTING' : 'CONFIRM'
   } catch (error) {
     onlineJoinError.value = error?.message || '暂时无法查询玩家资料，请稍后重试。'
@@ -1412,6 +1501,8 @@ function backToOnlineLookup() {
   onlineJoinMachines.value = []
   onlineJoinExistingRegistration.value = null
   onlineJoinPreference.value = null
+  onlineJoinQueueId.value = null
+  onlineJoinMachineConfigurationRevision.value = null
   onlineJoinCommandId.value = null
   onlineJoinResultRegistrationId.value = null
   onlineJoinTerminalApplied.value = false
@@ -1560,7 +1651,23 @@ async function submitOnlineJoin() {
     onlineJoinError.value = '所选机台当前不能接收新的登记，请重新查询。'
     return
   }
-  const preference = onlineJoinNeedsPreference.value
+  if (
+    !onlineJoinQueueId.value ||
+    !onlineJoinMachineConfigurationRevision.value
+  ) {
+    invalidateOnlineJoinConfirmation('登记确认信息已经失效，请重新查询玩家资料后再提交。')
+    return
+  }
+  if (
+    queueId.value !== onlineJoinQueueId.value ||
+    machineConfigurationRevision.value !== onlineJoinMachineConfigurationRevision.value
+  ) {
+    invalidateOnlineJoinConfirmation('现场队列或机台配置已更新，请重新查询玩家资料后再提交。')
+    return
+  }
+  const preference = machine.capacity === 1
+    ? 'SOLO'
+    : onlineJoinNeedsPreference.value
     ? onlineJoinPreference.value
     : profile.defaultPreference
   if (!['SOLO', 'OPEN_TO_JOIN'].includes(preference)) {
@@ -1581,7 +1688,9 @@ async function submitOnlineJoin() {
         request_id: requestId,
         qq: profile.qqNumber,
         machine_id: machine.id,
-        preference
+        preference,
+        expected_queue_id: onlineJoinQueueId.value,
+        expected_machine_configuration_revision: onlineJoinMachineConfigurationRevision.value
       })
     })
     const command = await readJsonResponse(response)
@@ -1593,7 +1702,13 @@ async function submitOnlineJoin() {
       scheduleOnlineCommandPoll()
     }
   } catch (error) {
-    onlineJoinError.value = error?.message || '线上登记暂时无法提交，请稍后重试。'
+    if (error?.code === 'QUEUE_CONTEXT_CHANGED') {
+      invalidateOnlineJoinConfirmation(
+        error?.message || '现场队列或机台配置已更新，请重新查询玩家资料后再提交。'
+      )
+    } else {
+      onlineJoinError.value = error?.message || '线上登记暂时无法提交，请稍后重试。'
+    }
   } finally {
     onlineJoinLoading.value = false
   }
@@ -1602,6 +1717,7 @@ async function submitOnlineJoin() {
 function handleKeydown(event) {
   if (event.key !== 'Escape') return
   if (onlineJoinVisible.value) closeOnlineJoin()
+  else if (selectedMachineDetail.value) closeMachineDetails()
   else if (pendingSelfRegistration.value) pendingSelfRegistration.value = null
   else closeDetail()
 }
@@ -1760,8 +1876,12 @@ onBeforeUnmount(() => {
       <div class="queue-machine-list" :aria-busy="loading">
         <section v-for="machine in machines" :key="machine.id" class="queue-machine">
           <header class="queue-machine-header">
-            <div>
-              <h2>{{ machine.name }}</h2>
+            <div class="queue-machine-heading">
+              <button class="queue-machine-title" type="button"
+                :aria-label="`查看${machine.name}详情`" @click="openMachineDetails(machine)">
+                <h2>{{ machine.name }}</h2>
+                <ChevronRight :size="18" aria-hidden="true" />
+              </button>
               <p>{{ machineSummary(machine) }}</p>
             </div>
             <span v-if="!machine.operational" class="queue-machine-state">已停止</span>
@@ -1972,6 +2092,7 @@ onBeforeUnmount(() => {
                     @click="selectOnlineJoinMachine(machine)">
                     <strong>{{ machine.name }}</strong>
                     <span>{{ onlineMachineEstimateText(machine) }}</span>
+                    <small v-if="machine.capacity === 1">仅单人游玩</small>
                   </button>
                 </div>
               </fieldset>
@@ -2013,6 +2134,7 @@ onBeforeUnmount(() => {
                     @click="selectOnlineJoinMachine(machine)">
                     <strong>{{ machine.name }}</strong>
                     <span>{{ onlineMachineEstimateText(machine) }}</span>
+                    <small v-if="machine.capacity === 1">仅单人游玩</small>
                   </button>
                 </div>
               </fieldset>
@@ -2033,6 +2155,14 @@ onBeforeUnmount(() => {
                 </div>
               </fieldset>
 
+              <div v-if="onlineJoinSinglePlayerMachine" class="queue-online-capacity-notice">
+                <Users :size="18" aria-hidden="true" />
+                <p>
+                  <strong>本次将使用“单人游玩”</strong>
+                  <span>该机台仅能容纳一人游玩。本次登记不会修改玩家资料中的默认游玩偏好。</span>
+                </p>
+              </div>
+
               <div class="queue-online-check-in-notice">
                 <TriangleAlert :size="18" aria-hidden="true" />
                 <p>
@@ -2044,7 +2174,8 @@ onBeforeUnmount(() => {
               <p v-if="onlineJoinError" class="queue-online-error" role="alert">{{ onlineJoinError }}</p>
               <div class="queue-online-actions">
                 <button type="button" @click="backToOnlineLookup">返回查询</button>
-                <button class="primary" type="button" :disabled="onlineJoinLoading || !selectedOnlineJoinMachine?.available"
+                <button class="primary" type="button"
+                  :disabled="onlineJoinLoading || !selectedOnlineJoinMachine?.available || (onlineJoinNeedsPreference && !onlineJoinPreference)"
                   @click="submitOnlineJoin">
                   {{ onlineJoinLoading ? '正在提交' : '完成并加入排队' }}
                 </button>
@@ -2102,6 +2233,51 @@ onBeforeUnmount(() => {
               </div>
               <button class="queue-online-primary" type="button" @click="closeOnlineJoin">查看队列</button>
             </div>
+          </section>
+        </div>
+      </Transition>
+
+      <Transition name="queue-dialog">
+        <div v-if="selectedMachineDetail" class="queue-detail-backdrop"
+          @click.self="closeMachineDetails">
+          <section class="queue-detail-dialog queue-machine-dialog" role="dialog" aria-modal="true"
+            :aria-label="`${selectedMachineDetail.name}详情`">
+            <header class="queue-detail-header">
+              <div>
+                <h2>{{ selectedMachineDetail.name }}</h2>
+                <p>{{ selectedMachineDetail.operational
+                  ? '当前正常使用'
+                  : `已停止使用：${stopReasonLabel(selectedMachineDetail.stopReason, selectedMachineDetail.stopReasonDetail)}` }}</p>
+              </div>
+              <button type="button" aria-label="关闭机台详情" title="关闭" @click="closeMachineDetails">
+                <X :size="20" aria-hidden="true" />
+              </button>
+            </header>
+            <dl class="queue-detail-metadata queue-machine-metadata">
+              <div><dt>机台编号</dt><dd>{{ selectedMachineDetail.id }}</dd></div>
+              <div><dt>机台备注</dt><dd>{{ selectedMachineDetail.configuration.remark }}</dd></div>
+              <div><dt>机台类型</dt><dd>{{ machineGameTypeName(selectedMachineDetail.configuration) }}</dd></div>
+              <div v-if="machineSupportsServer(selectedMachineDetail.configuration) && selectedMachineDetail.configuration.server !== 'HIDDEN'">
+                <dt>服务器</dt><dd>{{ machineServerName(selectedMachineDetail.configuration) }}</dd>
+              </div>
+              <div v-if="selectedMachineDetail.configuration.gameVersionVisible">
+                <dt>游戏版本</dt><dd>{{ selectedMachineDetail.configuration.gameVersion }}</dd>
+              </div>
+              <div><dt>游玩容量</dt><dd>{{ selectedMachineDetail.configuration.capacity }} 人</dd></div>
+              <div>
+                <dt>计划游玩时间</dt>
+                <dd v-if="selectedMachineDetail.configuration.capacity === 1">
+                  单人 {{ selectedMachineDetail.configuration.soloRoundMinutes }} 分钟
+                </dd>
+                <dd v-else>
+                  单人 {{ selectedMachineDetail.configuration.soloRoundMinutes }} 分钟，
+                  共同游玩 {{ selectedMachineDetail.configuration.sharedRoundMinutes }} 分钟
+                </dd>
+              </div>
+            </dl>
+            <p v-if="selectedMachineDetail.configuration.capacity === 1" class="queue-machine-capacity-detail">
+              这台机台仅能容纳一人游玩，登记会统一使用“单人游玩”。玩家资料中的默认游玩偏好不会改变。
+            </p>
           </section>
         </div>
       </Transition>
@@ -2383,7 +2559,10 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-machine { min-width: 0; padding: 17px; border: 1px solid color-mix(in srgb, var(--queue-separator) 74%, transparent); border-radius: 14px; background: var(--queue-card); }
 .queue-machine:only-child { grid-column: 1 / -1; }
 .queue-machine-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.queue-machine-header > div { min-width: 0; }
+.queue-machine-heading { min-width: 0; }
+.queue-machine-title { display: flex; min-width: 0; min-height: 36px; margin: -4px 0; padding: 4px 2px 4px 0; align-items: center; gap: 3px; border: 0; border-radius: 6px; color: var(--queue-text); background: transparent; text-align: left; cursor: pointer; }
+.queue-machine-title svg { flex: 0 0 auto; color: var(--queue-tertiary); transition: transform .16s ease, color .16s ease; }
+.queue-machine-title:hover svg, .queue-machine-title:focus-visible svg { color: var(--queue-blue); transform: translateX(2px); }
 .queue-machine-header h2 { margin: 0; border: 0; font-size: 19px; font-weight: 620; line-height: 1.35; letter-spacing: 0; }
 .queue-machine-header p { margin: 3px 0 0; color: var(--queue-secondary); font-size: 11px; line-height: 1.45; }
 .queue-machine-state { padding: 5px 8px; flex: 0 0 auto; border-radius: 6px; color: var(--queue-orange); background: var(--queue-soft-orange); font-size: 10px; font-weight: 650; }
@@ -2459,7 +2638,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 
 .queue-detail-backdrop { position: fixed; z-index: 10000; inset: 0; display: grid; padding: 18px; place-items: center; background: rgba(0, 0, 0, .42); }
 .queue-detail-dialog, .queue-confirm-dialog { --queue-card: #fff; --queue-position: #f5f5f7; --queue-text: #1d1d1f; --queue-secondary: #6e6e73; --queue-tertiary: #8e8e93; --queue-separator: #d2d2d7; --queue-blue: #007aff; --queue-soft-blue: #eaf3ff; --queue-orange: #b85c00; --queue-soft-orange: #fff1dc; --queue-online: #087f73; --queue-soft-online: #e8f7f4; width: min(100%, 480px); max-height: min(680px, calc(100vh - 36px)); padding: 20px; overflow-y: auto; border: 1px solid var(--queue-separator); border-radius: 16px; color: var(--queue-text); background: var(--queue-card); box-shadow: 0 20px 54px rgba(0, 0, 0, .22); }
-:global(html.dark) .queue-detail-dialog, :global(html.dark) .queue-confirm-dialog { --queue-card: #1c1c1e; --queue-position: #242426; --queue-text: #f5f5f7; --queue-secondary: #a1a1a6; --queue-tertiary: #8e8e93; --queue-separator: #38383a; --queue-blue: #0a84ff; --queue-soft-blue: #142b44; --queue-orange: #ffb35c; --queue-soft-orange: #3b2b13; --queue-online: #63d8ca; --queue-soft-online: #143632; }
+:global(html.dark .queue-detail-dialog), :global(html.dark .queue-confirm-dialog) { --queue-card: #1c1c1e; --queue-position: #242426; --queue-text: #f5f5f7; --queue-secondary: #a1a1a6; --queue-tertiary: #8e8e93; --queue-separator: #38383a; --queue-blue: #0a84ff; --queue-soft-blue: #142b44; --queue-orange: #ffb35c; --queue-soft-orange: #3b2b13; --queue-online: #63d8ca; --queue-soft-online: #143632; }
 .queue-detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .queue-detail-header > div { min-width: 0; }
 .queue-detail-header h2, .queue-confirm-dialog h2 { margin: 0; border: 0; overflow-wrap: anywhere; font-size: 22px; font-weight: 640; line-height: 1.3; letter-spacing: 0; }
@@ -2512,10 +2691,12 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-online-machine-options button:active:not(:disabled), .queue-online-preference-options button:active { transform: scale(.99); }
 .queue-online-machine-options button.active, .queue-online-preference-options button.active { border-color: color-mix(in srgb, var(--queue-blue) 62%, var(--queue-separator)); background: var(--queue-soft-blue); }
 .queue-online-machine-options button:disabled { color: var(--queue-tertiary); background: var(--queue-disabled); cursor: default; }
-.queue-online-machine-options strong, .queue-online-machine-options span, .queue-online-preference-options strong, .queue-online-preference-options span { display: block; }
+.queue-online-machine-options strong, .queue-online-machine-options span, .queue-online-machine-options small, .queue-online-preference-options strong, .queue-online-preference-options span { display: block; }
 .queue-online-machine-options strong, .queue-online-preference-options strong { font-size: 12px; font-weight: 610; line-height: 1.4; }
 .queue-online-machine-options span, .queue-online-preference-options span { margin-top: 4px; color: var(--queue-secondary); font-size: 9px; line-height: 1.45; }
+.queue-online-machine-options small { margin-top: 5px; color: var(--queue-online); font-size: 9px; font-weight: 610; line-height: 1.35; }
 .queue-online-machine-options button:disabled span { color: var(--queue-tertiary); }
+.queue-online-machine-options button:disabled small { color: var(--queue-tertiary); }
 .queue-online-profile { margin: 0; border-top: 1px solid var(--queue-separator); }
 .queue-online-profile > div { display: grid; min-height: 42px; padding: 8px 0; grid-template-columns: minmax(92px, auto) minmax(0, 1fr); align-items: center; gap: 14px; border-bottom: 1px solid var(--queue-separator); }
 .queue-online-profile dt, .queue-online-profile dd { margin: 0; font-size: 11px; line-height: 1.5; }
@@ -2531,6 +2712,14 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-online-check-in-notice strong, .queue-online-check-in-notice span { display: block; }
 .queue-online-check-in-notice strong { font-size: 11px; font-weight: 640; line-height: 1.45; }
 .queue-online-check-in-notice span { margin-top: 2px; color: var(--queue-secondary); font-size: 10px; line-height: 1.55; }
+.queue-online-capacity-notice { display: flex; padding: 11px 12px; align-items: flex-start; gap: 9px; border-left: 3px solid var(--queue-blue); color: var(--queue-blue); background: var(--queue-soft-blue); }
+.queue-online-capacity-notice > svg { margin-top: 1px; flex: 0 0 auto; }
+.queue-online-capacity-notice p { margin: 0; }
+.queue-online-capacity-notice strong, .queue-online-capacity-notice span { display: block; }
+.queue-online-capacity-notice strong { font-size: 11px; font-weight: 640; line-height: 1.45; }
+.queue-online-capacity-notice span { margin-top: 2px; color: var(--queue-secondary); font-size: 10px; line-height: 1.55; }
+.queue-machine-metadata { margin-top: 16px; }
+.queue-machine-capacity-detail { margin: 14px 0 0; padding: 11px 12px; border-left: 3px solid var(--queue-blue); color: var(--queue-secondary); background: var(--queue-soft-blue); font-size: 11px; line-height: 1.6; }
 .queue-online-error { margin: -4px 0 0; padding: 9px 10px; border-radius: 7px; color: var(--queue-red); background: var(--queue-soft-red); font-size: 10px; line-height: 1.5; }
 .queue-online-primary, .queue-online-secondary { display: flex; width: 100%; min-height: 44px; padding: 0 14px; align-items: center; justify-content: center; border: 0; border-radius: 9px; cursor: pointer; font-size: 12px; font-weight: 600; }
 .queue-online-primary { color: #fff; background: var(--queue-blue); }

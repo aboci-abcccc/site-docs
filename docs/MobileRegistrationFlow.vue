@@ -13,6 +13,7 @@ import {
 } from '@lucide/vue'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import MobileProfileSettings from './MobileProfileSettings.vue'
+import { normalizeMachineConfiguration } from './machineConfiguration.js'
 
 const props = defineProps({
   token: { type: String, required: true }
@@ -83,7 +84,18 @@ const confirmationProfile = computed(() => {
   return selectedProfile.value
 })
 
+const machineConfiguration = computed(() => normalizeMachineConfiguration(
+  session.value?.machine_configuration ?? session.value?.machineConfiguration,
+  {
+    id: session.value?.machine_id ?? session.value?.machineId,
+    name: session.value?.machine_name ?? session.value?.machineName
+  }
+))
+
+const singlePlayerMachine = computed(() => machineConfiguration.value.capacity === 1)
+
 const needsCurrentPreference = computed(() => (
+  !singlePlayerMachine.value &&
   confirmationProfile.value?.defaultPreference === 'ASK_EVERY_TIME'
 ))
 
@@ -256,7 +268,9 @@ async function loadProfiles(query) {
 
 function selectProfile(profile) {
   selectedProfile.value = profile
-  selectedPreference.value = profile.defaultPreference === 'ASK_EVERY_TIME'
+  selectedPreference.value = singlePlayerMachine.value
+    ? 'SOLO'
+    : profile.defaultPreference === 'ASK_EVERY_TIME'
     ? null
     : profile.defaultPreference
   errorDetail.value = ''
@@ -286,7 +300,9 @@ function beginNewProfile() {
 
 function continueNewProfile() {
   if (!newProfileValid.value) return
-  selectedPreference.value = newProfileDraft.default_preference === 'ASK_EVERY_TIME'
+  selectedPreference.value = singlePlayerMachine.value
+    ? 'SOLO'
+    : newProfileDraft.default_preference === 'ASK_EVERY_TIME'
     ? null
     : newProfileDraft.default_preference
   errorDetail.value = ''
@@ -319,7 +335,9 @@ function notificationPayload(draft) {
 
 async function submitRegistration() {
   const profile = confirmationProfile.value
-  const preference = needsCurrentPreference.value
+  const preference = singlePlayerMachine.value
+    ? 'SOLO'
+    : needsCurrentPreference.value
     ? selectedPreference.value
     : profile?.defaultPreference
   if (!profile || !['SOLO', 'OPEN_TO_JOIN'].includes(preference)) {
@@ -595,6 +613,10 @@ onBeforeUnmount(() => {
                 <button type="button" :class="{ active: selectedPreference === 'SOLO' }" @click="selectedPreference = 'SOLO'"><strong>单人游玩</strong><span>独自占用一个等待位置</span></button>
               </div>
             </fieldset>
+            <p v-if="singlePlayerMachine" class="mobile-information">
+              <Smartphone :size="17" aria-hidden="true" />
+              该机台仅能容纳一人游玩，本次将使用“单人游玩”。玩家资料中的默认游玩偏好不会改变。
+            </p>
             <p class="mobile-information"><Smartphone :size="17" aria-hidden="true" />这是在现场扫码建立的普通登记，成功后无需再签到。</p>
             <p v-if="errorDetail" class="mobile-form-error" role="alert">{{ errorDetail }}</p>
             <button class="mobile-primary" type="button" :disabled="needsCurrentPreference && !selectedPreference" @click="submitRegistration">确认并加入排队</button>

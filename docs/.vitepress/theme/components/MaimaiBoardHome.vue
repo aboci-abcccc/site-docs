@@ -13,7 +13,7 @@ const services = [
   {
     key: 'queue',
     title: '排队状态',
-    description: '查看两台舞萌机台的现场队列',
+    description: '查看现场各机台的实时排队状态',
     href: '/queue-status',
     icon: ListOrdered,
     tone: 'blue'

@@ -14,12 +14,7 @@ import {
 } from '@lucide/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import MobileRegistrationFlow from './MobileRegistrationFlow.vue'
-import {
-  machineGameTypeName,
-  machineServerName,
-  machineSupportsServer,
-  normalizeMachineConfiguration
-} from './machineConfiguration.js'
+import { normalizeMachineConfiguration } from './machineConfiguration.js'
 
 const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL || 'https://abcccc.top/api/queue-status'
 const QUEUE_LOG_API_URL = import.meta.env.VITE_QUEUE_LOG_API_URL ||
@@ -35,12 +30,20 @@ const SNAPSHOT_STALE_AFTER = 90000
 const ONLINE_COMMAND_POLL_INTERVAL = 1500
 const SELF_STORAGE_KEY = 'maimai-q:marked-registration:v1'
 const MAX_SELF_REGISTRATION_HISTORY = 24
-
-const SUPPORTED_MACHINE_IDS = ['A', 'B', 'C', 'D']
-const defaultMachineDefinitions = [
-  { id: 'A', name: '左侧 · 机台 A' },
-  { id: 'B', name: '右侧 · 机台 B' }
-]
+const SUPPORTED_MACHINE_IDS = [...'ABCDEFGHIJ']
+const DEFAULT_MACHINE_GROUP_ID = '00000000000000000000000000000001'
+const defaultMachineDefinitions = SUPPORTED_MACHINE_IDS.map((id, index) => ({
+  id,
+  name: index === 0
+    ? '左侧 · 机台 A'
+    : index === 1
+      ? '右侧 · 机台 B'
+      : index === 2
+        ? '中间左侧 · 机台 C'
+        : index === 3
+           ? '中间右侧 · 机台 D'
+           : `第 ${index + 1} 台 · 机台 ${id}`
+}))
 const logSourceDefinitions = [
   { value: 'ALL', label: '全部来源' },
   { value: 'ON_SITE_TERMINAL', label: '现场终端' },
@@ -50,7 +53,10 @@ const logSourceDefinitions = [
   { value: 'MOBILE_DEVICE', label: '移动设备' }
 ]
 
-const machines = ref(defaultMachineDefinitions.map(createEmptyMachine))
+const machines = ref(defaultMachineDefinitions.slice(0, 2).map(createEmptyMachine))
+const machineGroups = ref([{ id: DEFAULT_MACHINE_GROUP_ID, name: '分组 1' }])
+const defaultMachineGroupId = ref(DEFAULT_MACHINE_GROUP_ID)
+const activeMachineGroupId = ref(DEFAULT_MACHINE_GROUP_ID)
 const registrationOpen = ref(null)
 const businessHours = ref({
   enabled: false,
@@ -72,7 +78,6 @@ const refreshing = ref(false)
 const loadError = ref(false)
 const activeView = ref('queue')
 const selectedDetail = ref(null)
-const selectedMachineDetail = ref(null)
 const pendingSelfRegistration = ref(null)
 const markedSelf = ref(null)
 const currentLogs = ref([])
@@ -92,6 +97,7 @@ const onlineJoinQq = ref('')
 const onlineJoinMachineId = ref('A')
 const onlineJoinProfile = ref(null)
 const onlineJoinMachines = ref([])
+const onlineJoinGroups = ref([])
 const onlineJoinExistingRegistration = ref(null)
 const onlineJoinPreference = ref(null)
 const onlineJoinLoading = ref(false)
@@ -116,6 +122,18 @@ const machineCountSummary = computed(() => (
     ? '当前使用 1 台机台'
     : `${machines.value.length} 台机台的登记顺序彼此独立`
 ))
+
+const configuredMachineGroups = computed(() => machineGroups.value.map((group) => ({
+  ...group,
+  machines: machines.value.filter((machine) => machine.groupId === group.id)
+})).filter((group) => group.machines.length > 0))
+
+const activeMachineGroup = computed(() => (
+  configuredMachineGroups.value.find((group) => group.id === activeMachineGroupId.value) ||
+  configuredMachineGroups.value[0] || null
+))
+
+const visibleMachines = computed(() => activeMachineGroup.value?.machines ?? machines.value)
 
 const snapshotAgeMillis = computed(() => {
   const date = parseDate(capturedAt.value)
@@ -162,6 +180,8 @@ const onlineJoinMachineOptions = computed(() => {
   if (remote.length) return remote
   return machines.value.map((machine) => ({
     id: machine.id,
+    stableId: machine.stableId,
+    groupId: machine.groupId,
     name: machine.name,
     configuration: machine.configuration,
     capacity: machine.capacity,
@@ -187,6 +207,11 @@ const onlineJoinSinglePlayerMachine = computed(() => (
 const onlineJoinNeedsPreference = computed(() => (
   !onlineJoinSinglePlayerMachine.value &&
   onlineJoinProfile.value?.defaultPreference === 'ASK_EVERY_TIME'
+))
+
+const onlineJoinCanSubmit = computed(() => (
+  selectedOnlineJoinMachine.value?.available === true &&
+  (!onlineJoinNeedsPreference.value || ['SOLO', 'OPEN_TO_JOIN'].includes(onlineJoinPreference.value))
 ))
 
 const availability = computed(() => {
@@ -366,7 +391,13 @@ const filteredLogs = computed(() => {
     ? currentLogs.value
     : logFilter.value === 'SYSTEM'
       ? currentLogs.value.filter((event) => !event.machineId)
-      : currentLogs.value.filter((event) => event.machineId === logFilter.value)
+      : currentLogs.value.filter((event) => {
+          if (event.machineStableId) return event.machineStableId === logFilter.value
+          const selectedMachine = machines.value.find(
+            (machine) => machine.stableId === logFilter.value
+          )
+          return event.machineId === selectedMachine?.id
+        })
   return logSourceFilter.value === 'ALL'
     ? machineFiltered
     : machineFiltered.filter((event) => event.operationSource === logSourceFilter.value)
@@ -375,16 +406,32 @@ const filteredLogs = computed(() => {
 const logMachineFilters = computed(() => [
   { value: 'ALL', label: '全部' },
   ...machines.value.map((machine) => ({
-    value: machine.id,
+    value: machine.stableId,
     label: `机台 ${machine.id}`
   })),
   { value: 'SYSTEM', label: '系统' }
 ])
 
+const onlineJoinMachineGroups = computed(() => {
+  const groups = onlineJoinGroups.value.length
+    ? onlineJoinGroups.value
+    : configuredMachineGroups.value.map(({ id, name }) => ({ id, name }))
+  const fallbackGroup = groups[0] || { id: DEFAULT_MACHINE_GROUP_ID, name: '分组 1' }
+  const validGroupIds = new Set(groups.map((group) => group.id))
+  return groups.map((group) => ({
+    ...group,
+    machines: onlineJoinMachineOptions.value.filter((machine) => (
+      (validGroupIds.has(machine.groupId) ? machine.groupId : fallbackGroup.id) === group.id
+    ))
+  })).filter((group) => group.machines.length > 0)
+})
+
 function createEmptyMachine(definition) {
   const configuration = normalizeMachineConfiguration(null, definition)
   return {
     ...definition,
+    stableId: definition.stableId || defaultMachineStableId(definition.id),
+    groupId: definition.groupId || DEFAULT_MACHINE_GROUP_ID,
     remark: configuration.remark,
     configuration,
     capacity: configuration.capacity,
@@ -397,6 +444,16 @@ function createEmptyMachine(definition) {
     waitingPositions: [],
     registrationCount: 0
   }
+}
+
+function defaultMachineStableId(machineId) {
+  const index = SUPPORTED_MACHINE_IDS.indexOf(machineId)
+  return Math.max(1, index + 1).toString(16).padStart(32, '0')
+}
+
+function normalizeInternalId(value) {
+  const id = String(value || '').trim().toLowerCase()
+  return /^[0-9a-f]{32}$/.test(id) ? id : null
 }
 
 function parseDate(value) {
@@ -483,6 +540,7 @@ function normalizePosition(source, index) {
     estimatedWaitMinutes: toNonNegativeInteger(
       source?.estimated_wait_minutes ?? source?.estimatedWaitMinutes
     ),
+    capacity: Number(source?.configuration?.capacity ?? source?.capacity) === 1 ? 1 : 2,
     positionId: source?.position_id ?? source?.positionId ?? null,
     commonPlayPreview: normalizeCommonPlayPreview(
       source?.common_play_preview ?? source?.commonPlayPreview
@@ -516,6 +574,8 @@ function normalizeMachine(definition, source) {
   return {
     ...definition,
     name: source.name || definition.name,
+    stableId: definition.stableId,
+    groupId: definition.groupId,
     remark: configuration.remark,
     configuration,
     capacity: configuration.capacity,
@@ -543,34 +603,77 @@ function machineSource(sources, definition) {
 }
 
 function machineDefinitionsFromSources(sources) {
-  const sourceById = new Map()
   const entries = Array.isArray(sources)
     ? sources.map((source) => [source?.id ?? source?.machine_id, source])
     : Object.entries(sources)
-  entries.forEach(([sourceId, source]) => {
-    const id = String(sourceId || '').toUpperCase()
-    if (!SUPPORTED_MACHINE_IDS.includes(id) || sourceById.has(id)) {
-      throw new Error('Invalid machine configuration')
-    }
-    sourceById.set(id, source)
-  })
-
-  const configuredIds = SUPPORTED_MACHINE_IDS.slice(0, sourceById.size)
+  const normalizedEntries = entries.map(([key, source]) => ({
+    id: String(source?.id ?? source?.machine_id ?? key ?? '').trim().toUpperCase(),
+    source
+  }))
+  const configuredIds = SUPPORTED_MACHINE_IDS.slice(0, normalizedEntries.length)
+  const sourceIds = normalizedEntries.map(({ id }) => id)
   if (
-    !sourceById.size ||
-    sourceById.size > SUPPORTED_MACHINE_IDS.length ||
-    !configuredIds.every((id) => sourceById.has(id))
+    !normalizedEntries.length ||
+    normalizedEntries.length > SUPPORTED_MACHINE_IDS.length ||
+    new Set(sourceIds).size !== sourceIds.length ||
+    configuredIds.some((id) => !sourceIds.includes(id))
   ) {
     throw new Error('Invalid machine configuration')
   }
-
   return configuredIds.map((id) => ({
     definition: defaultMachineDefinitions.find((definition) => definition.id === id) || {
       id,
       name: `机台 ${id}`
     },
-    source: sourceById.get(id)
+    source: normalizedEntries.find((entry) => entry.id === id).source
   }))
+}
+
+function normalizeMachineLayout(data, definitionsWithSources) {
+  const rawGroups = data?.machine_groups ?? data?.machineGroups
+  const groups = []
+  const seenGroupIds = new Set()
+  if (Array.isArray(rawGroups)) {
+    rawGroups.forEach((source, index) => {
+      const id = normalizeInternalId(source?.id)
+      const name = String(source?.name || '').trim()
+      if (id && name && !seenGroupIds.has(id)) {
+        groups.push({ id, name: name.slice(0, 12), index })
+        seenGroupIds.add(id)
+      }
+    })
+  }
+  if (!groups.length) groups.push({ id: DEFAULT_MACHINE_GROUP_ID, name: '分组 1', index: 0 })
+
+  const requestedDefaultId = normalizeInternalId(
+    data?.default_machine_group_id ?? data?.defaultMachineGroupId
+  )
+  const fallbackGroupId = groups.some((group) => group.id === requestedDefaultId)
+    ? requestedDefaultId
+    : groups[0].id
+  const usedStableIds = new Set()
+  const definitions = definitionsWithSources.map(({ definition, source }, index) => {
+    const sourceStableId = normalizeInternalId(source?.stable_id ?? source?.stableId)
+    let stableId = sourceStableId && !usedStableIds.has(sourceStableId)
+      ? sourceStableId
+      : defaultMachineStableId(definition.id)
+    if (usedStableIds.has(stableId)) stableId = `${index + 1}`.padStart(32, 'f').slice(-32)
+    usedStableIds.add(stableId)
+    const sourceGroupId = normalizeInternalId(source?.group_id ?? source?.groupId)
+    const groupId = groups.some((group) => group.id === sourceGroupId)
+      ? sourceGroupId
+      : fallbackGroupId
+    return { ...definition, stableId, groupId }
+  })
+
+  const usedGroupIds = new Set(definitions.map(({ groupId }) => groupId))
+  const configuredGroups = groups
+    .filter((group) => usedGroupIds.has(group.id))
+    .map(({ id, name }) => ({ id, name }))
+  const normalizedDefaultId = configuredGroups.some((group) => group.id === requestedDefaultId)
+    ? requestedDefaultId
+    : configuredGroups[0]?.id || DEFAULT_MACHINE_GROUP_ID
+  return { definitions, groups: configuredGroups, defaultGroupId: normalizedDefaultId }
 }
 
 function normalizeBusinessHours(source) {
@@ -613,8 +716,10 @@ function applyServerData(data) {
     currentLogsQueueId.value = null
     currentLogsNextCursor.value = null
   }
-  const normalizedMachines = machineDefinitionsFromSources(sources).map(({ definition, source }) => (
-    normalizeMachine(definition, source)
+  const definitionsWithSources = machineDefinitionsFromSources(sources)
+  const layout = normalizeMachineLayout(data, definitionsWithSources)
+  const normalizedMachines = layout.definitions.map((definition, index) => (
+    normalizeMachine(definition, definitionsWithSources[index].source)
   ))
   if (
     ['CONFIRM', 'EXISTING'].includes(onlineJoinStep.value) &&
@@ -630,13 +735,15 @@ function applyServerData(data) {
   }
   machines.value = normalizedMachines
   machineConfigurationRevision.value = nextMachineConfigurationRevision
-  if (selectedMachineDetail.value) {
-    selectedMachineDetail.value = normalizedMachines.find(
-      (machine) => machine.id === selectedMachineDetail.value.id
-    ) || null
+  machineGroups.value = layout.groups
+  defaultMachineGroupId.value = layout.defaultGroupId
+  const availableGroupIds = new Set(layout.groups.map((group) => group.id))
+  if (!hasSnapshot.value || !availableGroupIds.has(activeMachineGroupId.value)) {
+    activeMachineGroupId.value = layout.defaultGroupId
   }
   const machineIds = new Set(normalizedMachines.map((machine) => machine.id))
-  if (!['ALL', 'SYSTEM'].includes(logFilter.value) && !machineIds.has(logFilter.value)) {
+  const machineStableIds = new Set(normalizedMachines.map((machine) => machine.stableId))
+  if (!['ALL', 'SYSTEM'].includes(logFilter.value) && !machineStableIds.has(logFilter.value)) {
     logFilter.value = 'ALL'
   }
   if (!machineIds.has(onlineJoinMachineId.value)) {
@@ -690,6 +797,10 @@ function normalizeLogEvent(source) {
     eventId: source?.event_id ?? source?.eventId ?? null,
     occurredAt: source?.occurred_at ?? source?.occurredAt ?? null,
     machineId: source?.machine_id ?? source?.machineId ?? null,
+    machineStableId: normalizeInternalId(
+      source?.machine_stable_id ?? source?.machineStableId
+    ),
+    machineName: String(source?.machine_name ?? source?.machineName ?? '').trim() || null,
     type: String(source?.type || 'OTHER').toUpperCase(),
     title: String(source?.title || '队列已更新'),
     detail: String(source?.detail || ''),
@@ -779,6 +890,16 @@ function switchView(view) {
   if (view === 'logs') loadCurrentLogs(true)
 }
 
+function selectMachineGroup(groupId) {
+  if (configuredMachineGroups.value.some((group) => group.id === groupId)) {
+    activeMachineGroupId.value = groupId
+  }
+}
+
+function showMachineGroup(machine) {
+  if (machine?.groupId) selectMachineGroup(machine.groupId)
+}
+
 function restoreMarkedSelf() {
   try {
     const parsed = JSON.parse(window.localStorage.getItem(SELF_STORAGE_KEY) || 'null')
@@ -809,7 +930,8 @@ function requestMarkAsSelf(registration) {
     ],
     displayId: registration.displayId,
     qqNumber: normalizeQqNumber(registration.qqNumber),
-    markedAt: Date.now()
+    markedAt: Date.now(),
+    machineId: selectedDetail.value?.machine?.id || null
   }
   if (
     markedSelf.value &&
@@ -820,11 +942,17 @@ function requestMarkAsSelf(registration) {
     return
   }
   saveMarkedSelf(nextIdentity)
+  showMachineGroup(selectedDetail.value?.machine)
   selectedDetail.value = null
 }
 
 function confirmReplaceMarkedSelf() {
-  if (pendingSelfRegistration.value) saveMarkedSelf(pendingSelfRegistration.value)
+  if (pendingSelfRegistration.value) {
+    saveMarkedSelf(pendingSelfRegistration.value)
+    showMachineGroup(machines.value.find((machine) => (
+      machine.id === pendingSelfRegistration.value.machineId
+    )))
+  }
   pendingSelfRegistration.value = null
 }
 
@@ -876,6 +1004,16 @@ function normalizePlayerNickname(value) {
 function reconcileSelectedDetail() {
   const detail = selectedDetail.value
   if (!detail) return
+
+  if (detail.kind === 'machine') {
+    const machine = machines.value.find(({ stableId }) => stableId === detail.machine.stableId)
+    if (!machine) {
+      selectedDetail.value = null
+      return
+    }
+    openMachineDetails(machine)
+    return
+  }
 
   if (detail.kind === 'registration') {
     const location = registrationLocations.value.find(({ registration }) => (
@@ -968,6 +1106,40 @@ function machineSummary(machine) {
   const queueSummary = `${machine.waitingPositions.length} 个等待位置 · ${machine.registrationCount} 个登记`
   if (!machine.operational) return `${queueSummary} · 已停止使用`
   return machine.registrationCount > 0 ? queueSummary : '当前空闲'
+}
+
+function machineGameTypeLabel(configuration) {
+  if (configuration.gameType === 'OTHER') return configuration.customGameType || '其他'
+  return {
+    MAIMAI_DX: '舞萌 DX',
+    CHUNITHM: '中二节奏',
+    ONGEKI: 'Ongeki',
+    DANCE_CUBE: '舞立方',
+    TAIKO_NO_TATSUJIN: '太鼓达人'
+  }[configuration.gameType] || '舞萌 DX'
+}
+
+function machineServerLabel(configuration) {
+  if (configuration.server === 'HIDDEN') return null
+  if (configuration.server === 'OTHER') return configuration.customServer || '其他'
+  return {
+    CHINA: '中国',
+    INTERNATIONAL: '国际',
+    JAPAN: '日本',
+    DABING: '大饼',
+    RINNET: 'RinNET'
+  }[configuration.server] || null
+}
+
+function machineRoundTimeLabel(configuration) {
+  if (configuration.capacity === 1) {
+    return `单人游玩 ${configuration.soloRoundMinutes} 分钟`
+  }
+  return `单人游玩 ${configuration.soloRoundMinutes} 分钟；共同游玩 ${configuration.sharedRoundMinutes} 分钟`
+}
+
+function machineGroupName(machine) {
+  return machineGroups.value.find((group) => group.id === machine.groupId)?.name || '分组 1'
 }
 
 function playingLabel(machine) {
@@ -1090,11 +1262,11 @@ function openPosition(machine, position = null) {
 }
 
 function openMachineDetails(machine) {
-  selectedMachineDetail.value = machine
-}
-
-function closeMachineDetails() {
-  selectedMachineDetail.value = null
+  selectedDetail.value = {
+    kind: 'machine',
+    title: machine.name,
+    machine
+  }
 }
 
 function openRegistration(
@@ -1269,7 +1441,16 @@ function eventTypeLabel(type) {
 
 function logMachineLabel(event) {
   if (!event.machineId) return '系统'
+  if (event.machineStableId) {
+    const currentMachine = machines.value.find(
+      (machine) => machine.stableId === event.machineStableId
+    )
+    if (currentMachine) return currentMachine.name
+    if (event.machineName) return `${event.machineName}（已删除）`
+    return '已删除的机台'
+  }
   return machines.value.find((machine) => machine.id === event.machineId)?.name ||
+    event.machineName ||
     `机台 ${event.machineId}`
 }
 
@@ -1311,6 +1492,12 @@ function normalizeOnlineMachine(source) {
   const available = source?.available === true && operational && registrationCount < 20
   return {
     id,
+    stableId: normalizeInternalId(source?.stable_id ?? source?.stableId) ||
+      machines.value.find((machine) => machine.id === id)?.stableId ||
+      defaultMachineStableId(id),
+    groupId: normalizeInternalId(source?.group_id ?? source?.groupId) ||
+      machines.value.find((machine) => machine.id === id)?.groupId ||
+      DEFAULT_MACHINE_GROUP_ID,
     name,
     configuration,
     capacity: configuration.capacity,
@@ -1323,6 +1510,27 @@ function normalizeOnlineMachine(source) {
     unavailableReason: source?.unavailable_reason ?? source?.unavailableReason ??
       (!operational ? '机台已停止使用' : registrationCount >= 20 ? '登记已满' : null)
   }
+}
+
+function normalizeOnlineGroups(data, remoteMachines) {
+  const source = data?.machine_groups ?? data?.machineGroups
+  const groups = []
+  const seenIds = new Set()
+  if (Array.isArray(source)) {
+    source.forEach((group) => {
+      const id = normalizeInternalId(group?.id)
+      const name = String(group?.name || '').trim()
+      if (id && name && !seenIds.has(id)) {
+        groups.push({ id, name: name.slice(0, 12) })
+        seenIds.add(id)
+      }
+    })
+  }
+  if (!groups.length) {
+    return configuredMachineGroups.value.map(({ id, name }) => ({ id, name }))
+  }
+  const usedIds = new Set(remoteMachines.map((machine) => machine.groupId))
+  return groups.filter((group) => usedIds.has(group.id))
 }
 
 function normalizeOnlineProfile(source) {
@@ -1368,6 +1576,7 @@ function resetOnlineJoin() {
   onlineJoinMachineId.value = firstAvailableOnlineMachineId()
   onlineJoinProfile.value = null
   onlineJoinMachines.value = []
+  onlineJoinGroups.value = []
   onlineJoinExistingRegistration.value = null
   onlineJoinPreference.value = null
   onlineJoinLoading.value = false
@@ -1470,13 +1679,15 @@ async function queryOnlineProfile() {
         data.machine_configuration_revision ?? data.machineConfigurationRevision
       ) || machineConfigurationRevision.value
     )
-    onlineJoinMachines.value = Array.isArray(data.machines)
+    const remoteMachines = Array.isArray(data.machines)
       ? data.machines.map(normalizeOnlineMachine)
         .filter((machine) => SUPPORTED_MACHINE_IDS.includes(machine.id))
         .sort((first, second) => (
           SUPPORTED_MACHINE_IDS.indexOf(first.id) - SUPPORTED_MACHINE_IDS.indexOf(second.id)
         ))
       : []
+    onlineJoinMachines.value = remoteMachines
+    onlineJoinGroups.value = normalizeOnlineGroups(data, remoteMachines)
     if (!onlineJoinMachines.value.some((machine) => machine.id === onlineJoinMachineId.value)) {
       onlineJoinMachineId.value = firstAvailableOnlineMachineId()
     }
@@ -1499,11 +1710,14 @@ function backToOnlineLookup() {
   onlineJoinStep.value = 'LOOKUP'
   onlineJoinProfile.value = null
   onlineJoinMachines.value = []
+  onlineJoinGroups.value = []
   onlineJoinExistingRegistration.value = null
   onlineJoinPreference.value = null
   onlineJoinQueueId.value = null
   onlineJoinMachineConfigurationRevision.value = null
   onlineJoinCommandId.value = null
+  onlineJoinQueueId.value = null
+  onlineJoinMachineConfigurationRevision.value = null
   onlineJoinResultRegistrationId.value = null
   onlineJoinTerminalApplied.value = false
   onlineJoinError.value = ''
@@ -1552,13 +1766,15 @@ function markOnlinePlayerAsSelf(registration = null, allowReplacementPrompt = tr
   const targetQueueId = onlineJoinQueueId.value || queueId.value
   if (!profile || !targetQueueId) return false
   const registrationId = registration?.registration_id ?? registration?.registrationId ?? ''
+  const machineId = registration?.machine_id ?? registration?.machineId ?? onlineJoinMachineId.value
   const playerIdentity = {
     queueId: targetQueueId,
     registrationId,
     registrationIds: [registrationId].filter(Boolean),
     displayId: profile.nickname,
     qqNumber: profile.qqNumber,
-    markedAt: Date.now()
+    markedAt: Date.now(),
+    machineId
   }
   const continuesExistingMark = !markedSelf.value || isSameMarkedPlayer(
     markedSelf.value,
@@ -1572,6 +1788,7 @@ function markOnlinePlayerAsSelf(registration = null, allowReplacementPrompt = tr
     ...playerIdentity,
     registrationIds: [registrationId, ...knownSelfRegistrationIds()].filter(Boolean)
   })
+  showMachineGroup(machines.value.find((machine) => machine.id === machineId))
   return true
 }
 
@@ -1622,6 +1839,7 @@ async function pollOnlineJoinCommand() {
       onlineJoinResultRegistrationId.value = resultRegistrationId || null
       onlineJoinResultDetail.value = command.result_detail || '线上登记已经加入等待顺序。'
       onlineJoinStep.value = 'SUCCESS'
+      showMachineGroup(machines.value.find((machine) => machine.id === onlineJoinMachineId.value))
       markOnlinePlayerAsSelf(
         appliedLocation?.registration || { registrationId: resultRegistrationId || '' },
         false
@@ -1669,7 +1887,9 @@ async function submitOnlineJoin() {
     ? 'SOLO'
     : onlineJoinNeedsPreference.value
     ? onlineJoinPreference.value
-    : profile.defaultPreference
+    : machine.capacity === 1
+      ? 'SOLO'
+      : profile.defaultPreference
   if (!['SOLO', 'OPEN_TO_JOIN'].includes(preference)) {
     onlineJoinError.value = '请选择本次游玩偏好。'
     return
@@ -1717,7 +1937,6 @@ async function submitOnlineJoin() {
 function handleKeydown(event) {
   if (event.key !== 'Escape') return
   if (onlineJoinVisible.value) closeOnlineJoin()
-  else if (selectedMachineDetail.value) closeMachineDetails()
   else if (pendingSelfRegistration.value) pendingSelfRegistration.value = null
   else closeDetail()
 }
@@ -1873,17 +2092,24 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <div class="queue-machine-list" :aria-busy="loading">
-        <section v-for="machine in machines" :key="machine.id" class="queue-machine">
+      <nav v-if="configuredMachineGroups.length > 1" class="queue-machine-groups" aria-label="机台分组">
+        <button v-for="group in configuredMachineGroups" :key="group.id" type="button"
+          :class="{ active: activeMachineGroup?.id === group.id }" @click="selectMachineGroup(group.id)">
+          <span>{{ group.name }}</span>
+          <small>{{ group.machines.map((machine) => machine.id).join('、') }}</small>
+        </button>
+      </nav>
+
+      <div class="queue-machine-list" :class="{ 'is-single': visibleMachines.length === 1 }" :aria-busy="loading">
+        <section v-for="machine in visibleMachines" :key="machine.stableId" class="queue-machine">
           <header class="queue-machine-header">
-            <div class="queue-machine-heading">
-              <button class="queue-machine-title" type="button"
-                :aria-label="`查看${machine.name}详情`" @click="openMachineDetails(machine)">
-                <h2>{{ machine.name }}</h2>
-                <ChevronRight :size="18" aria-hidden="true" />
-              </button>
-              <p>{{ machineSummary(machine) }}</p>
-            </div>
+            <button type="button" :aria-label="`查看${machine.name}详情`" @click="openMachineDetails(machine)">
+              <span>
+                <strong class="queue-machine-title">{{ machine.name }}</strong>
+                <span class="queue-machine-summary">{{ machineSummary(machine) }}</span>
+              </span>
+              <ChevronRight :size="18" aria-hidden="true" />
+            </button>
             <span v-if="!machine.operational" class="queue-machine-state">已停止</span>
           </header>
 
@@ -2086,14 +2312,19 @@ onBeforeUnmount(() => {
               </label>
               <fieldset class="queue-online-options">
                 <legend>选择机台</legend>
-                <div class="queue-online-machine-options">
-                  <button v-for="machine in onlineJoinMachineOptions" :key="machine.id" type="button"
-                    :class="{ active: onlineJoinMachineId === machine.id }" :disabled="!machine.available"
-                    @click="selectOnlineJoinMachine(machine)">
-                    <strong>{{ machine.name }}</strong>
-                    <span>{{ onlineMachineEstimateText(machine) }}</span>
-                    <small v-if="machine.capacity === 1">仅单人游玩</small>
-                  </button>
+                <div class="queue-online-machine-groups">
+                  <section v-for="group in onlineJoinMachineGroups" :key="group.id">
+                    <h3 v-if="onlineJoinMachineGroups.length > 1">{{ group.name }}</h3>
+                    <div class="queue-online-machine-options">
+                      <button v-for="machine in group.machines" :key="machine.stableId || machine.id" type="button"
+                        :class="{ active: onlineJoinMachineId === machine.id }" :disabled="!machine.available"
+                        @click="selectOnlineJoinMachine(machine)">
+                        <strong>{{ machine.name }}</strong>
+                        <span>{{ machine.capacity === 1 ? '仅单人游玩' : onlineMachineEstimateText(machine) }}</span>
+                        <span v-if="machine.capacity === 1">{{ onlineMachineEstimateText(machine) }}</span>
+                      </button>
+                    </div>
+                  </section>
                 </div>
               </fieldset>
               <p v-if="onlineJoinError" class="queue-online-error" role="alert">{{ onlineJoinError }}</p>
@@ -2128,14 +2359,19 @@ onBeforeUnmount(() => {
 
               <fieldset class="queue-online-options">
                 <legend>排队机台</legend>
-                <div class="queue-online-machine-options">
-                  <button v-for="machine in onlineJoinMachineOptions" :key="machine.id" type="button"
-                    :class="{ active: onlineJoinMachineId === machine.id }" :disabled="!machine.available"
-                    @click="selectOnlineJoinMachine(machine)">
-                    <strong>{{ machine.name }}</strong>
-                    <span>{{ onlineMachineEstimateText(machine) }}</span>
-                    <small v-if="machine.capacity === 1">仅单人游玩</small>
-                  </button>
+                <div class="queue-online-machine-groups">
+                  <section v-for="group in onlineJoinMachineGroups" :key="group.id">
+                    <h3 v-if="onlineJoinMachineGroups.length > 1">{{ group.name }}</h3>
+                    <div class="queue-online-machine-options">
+                      <button v-for="machine in group.machines" :key="machine.stableId || machine.id" type="button"
+                        :class="{ active: onlineJoinMachineId === machine.id }" :disabled="!machine.available"
+                        @click="selectOnlineJoinMachine(machine)">
+                        <strong>{{ machine.name }}</strong>
+                        <span>{{ machine.capacity === 1 ? '仅单人游玩' : onlineMachineEstimateText(machine) }}</span>
+                        <span v-if="machine.capacity === 1">{{ onlineMachineEstimateText(machine) }}</span>
+                      </button>
+                    </div>
+                  </section>
                 </div>
               </fieldset>
 
@@ -2174,8 +2410,7 @@ onBeforeUnmount(() => {
               <p v-if="onlineJoinError" class="queue-online-error" role="alert">{{ onlineJoinError }}</p>
               <div class="queue-online-actions">
                 <button type="button" @click="backToOnlineLookup">返回查询</button>
-                <button class="primary" type="button"
-                  :disabled="onlineJoinLoading || !selectedOnlineJoinMachine?.available || (onlineJoinNeedsPreference && !onlineJoinPreference)"
+                <button class="primary" type="button" :disabled="onlineJoinLoading || !onlineJoinCanSubmit"
                   @click="submitOnlineJoin">
                   {{ onlineJoinLoading ? '正在提交' : '完成并加入排队' }}
                 </button>
@@ -2238,65 +2473,71 @@ onBeforeUnmount(() => {
       </Transition>
 
       <Transition name="queue-dialog">
-        <div v-if="selectedMachineDetail" class="queue-detail-backdrop"
-          @click.self="closeMachineDetails">
-          <section class="queue-detail-dialog queue-machine-dialog" role="dialog" aria-modal="true"
-            :aria-label="`${selectedMachineDetail.name}详情`">
-            <header class="queue-detail-header">
-              <div>
-                <h2>{{ selectedMachineDetail.name }}</h2>
-                <p>{{ selectedMachineDetail.operational
-                  ? '当前正常使用'
-                  : `已停止使用：${stopReasonLabel(selectedMachineDetail.stopReason, selectedMachineDetail.stopReasonDetail)}` }}</p>
-              </div>
-              <button type="button" aria-label="关闭机台详情" title="关闭" @click="closeMachineDetails">
-                <X :size="20" aria-hidden="true" />
-              </button>
-            </header>
-            <dl class="queue-detail-metadata queue-machine-metadata">
-              <div><dt>机台编号</dt><dd>{{ selectedMachineDetail.id }}</dd></div>
-              <div><dt>机台备注</dt><dd>{{ selectedMachineDetail.configuration.remark }}</dd></div>
-              <div><dt>机台类型</dt><dd>{{ machineGameTypeName(selectedMachineDetail.configuration) }}</dd></div>
-              <div v-if="machineSupportsServer(selectedMachineDetail.configuration) && selectedMachineDetail.configuration.server !== 'HIDDEN'">
-                <dt>服务器</dt><dd>{{ machineServerName(selectedMachineDetail.configuration) }}</dd>
-              </div>
-              <div v-if="selectedMachineDetail.configuration.gameVersionVisible">
-                <dt>游戏版本</dt><dd>{{ selectedMachineDetail.configuration.gameVersion }}</dd>
-              </div>
-              <div><dt>游玩容量</dt><dd>{{ selectedMachineDetail.configuration.capacity }} 人</dd></div>
-              <div>
-                <dt>计划游玩时间</dt>
-                <dd v-if="selectedMachineDetail.configuration.capacity === 1">
-                  单人 {{ selectedMachineDetail.configuration.soloRoundMinutes }} 分钟
-                </dd>
-                <dd v-else>
-                  单人 {{ selectedMachineDetail.configuration.soloRoundMinutes }} 分钟，
-                  共同游玩 {{ selectedMachineDetail.configuration.sharedRoundMinutes }} 分钟
-                </dd>
-              </div>
-            </dl>
-            <p v-if="selectedMachineDetail.configuration.capacity === 1" class="queue-machine-capacity-detail">
-              这台机台仅能容纳一人游玩，登记会统一使用“单人游玩”。玩家资料中的默认游玩偏好不会改变。
-            </p>
-          </section>
-        </div>
-      </Transition>
-
-      <Transition name="queue-dialog">
         <div v-if="selectedDetail" class="queue-detail-backdrop" @click.self="closeDetail">
           <section class="queue-detail-dialog" role="dialog" aria-modal="true" :aria-label="selectedDetail.title">
             <header class="queue-detail-header">
               <div>
                 <h2>{{ selectedDetail.title }}</h2>
                 <p v-if="selectedDetail.kind === 'registration'">{{ selectedDetail.locationLabel }}</p>
-                <p v-else>{{ selectedDetail.isPlaying ? selectedDetail.playingText : positionEstimateText(selectedDetail.estimate, selectedDetail.registrations, selectedDetail.machine) }}</p>
+                <p v-else-if="selectedDetail.kind === 'position'">{{ selectedDetail.isPlaying ? selectedDetail.playingText : positionEstimateText(selectedDetail.estimate, selectedDetail.registrations, selectedDetail.machine) }}</p>
+                <p v-else>机台 {{ selectedDetail.machine.id }}·{{ machineGroupName(selectedDetail.machine) }}</p>
               </div>
               <button type="button" aria-label="关闭详情" title="关闭" @click="closeDetail">
                 <X :size="20" aria-hidden="true" />
               </button>
             </header>
 
-            <template v-if="selectedDetail.kind === 'position'">
+            <template v-if="selectedDetail.kind === 'machine'">
+              <div class="queue-detail-pills">
+                <span>{{ machineGameTypeLabel(selectedDetail.machine.configuration) }}</span>
+                <span :class="{ 'is-absence': !selectedDetail.machine.operational }">
+                  {{ selectedDetail.machine.operational ? '正常使用' : '已停止使用' }}
+                </span>
+              </div>
+              <dl class="queue-detail-metadata">
+                <div>
+                  <dt>机台编号</dt>
+                  <dd>{{ selectedDetail.machine.id }}</dd>
+                </div>
+                <div>
+                  <dt>机台备注</dt>
+                  <dd>{{ selectedDetail.machine.configuration.remark || '未填写' }}</dd>
+                </div>
+                <div v-if="configuredMachineGroups.length > 1">
+                  <dt>所属分组</dt>
+                  <dd>{{ machineGroupName(selectedDetail.machine) }}</dd>
+                </div>
+                <div>
+                  <dt>机台类型</dt>
+                  <dd>{{ machineGameTypeLabel(selectedDetail.machine.configuration) }}</dd>
+                </div>
+                <div v-if="machineServerLabel(selectedDetail.machine.configuration)">
+                  <dt>服务器</dt>
+                  <dd>{{ machineServerLabel(selectedDetail.machine.configuration) }}</dd>
+                </div>
+                <div v-if="selectedDetail.machine.configuration.gameVersionVisible && selectedDetail.machine.configuration.gameVersion">
+                  <dt>游戏版本</dt>
+                  <dd>{{ selectedDetail.machine.configuration.gameVersion }}</dd>
+                </div>
+                <div>
+                  <dt>游玩容量</dt>
+                  <dd>{{ selectedDetail.machine.configuration.capacity }} 人</dd>
+                </div>
+                <div>
+                  <dt>计划游玩时间</dt>
+                  <dd>{{ machineRoundTimeLabel(selectedDetail.machine.configuration) }}</dd>
+                </div>
+                <div v-if="!selectedDetail.machine.operational">
+                  <dt>停止原因</dt>
+                  <dd>{{ stopReasonLabel(
+                    selectedDetail.machine.stopReason,
+                    selectedDetail.machine.stopReasonDetail
+                  ) }}</dd>
+                </div>
+              </dl>
+            </template>
+
+            <template v-else-if="selectedDetail.kind === 'position'">
               <div class="queue-detail-pills">
                 <span>{{ selectedDetail.registrations.length }} 个登记</span>
                 <span v-if="!selectedDetail.machine.operational">
@@ -2555,16 +2796,24 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-natural-notice strong { color: var(--queue-text); font-size: 13px; }
 .queue-natural-notice span { margin-top: 2px; font-size: 11px; line-height: 1.5; }
 
+.queue-machine-groups { display: flex; min-width: 0; margin: 0 0 14px; padding: 3px; overflow-x: auto; gap: 3px; border-radius: 10px; background: color-mix(in srgb, var(--queue-separator) 42%, transparent); scrollbar-width: thin; }
+.queue-machine-groups button { display: flex; min-width: 112px; min-height: 42px; padding: 6px 12px; align-items: flex-start; justify-content: center; flex-direction: column; border: 0; border-radius: 8px; color: var(--queue-secondary); background: transparent; cursor: pointer; white-space: nowrap; }
+.queue-machine-groups button.active { color: var(--queue-text); background: var(--queue-card); box-shadow: 0 1px 3px rgba(0, 0, 0, .08); }
+.queue-machine-groups span, .queue-machine-groups small { display: block; }
+.queue-machine-groups span { font-size: 11px; font-weight: 620; }
+.queue-machine-groups small { margin-top: 1px; color: var(--queue-tertiary); font-size: 9px; }
 .queue-machine-list { display: grid; gap: 16px; }
+.queue-machine-list.is-single { grid-template-columns: minmax(0, 1fr); }
 .queue-machine { min-width: 0; padding: 17px; border: 1px solid color-mix(in srgb, var(--queue-separator) 74%, transparent); border-radius: 14px; background: var(--queue-card); }
 .queue-machine:only-child { grid-column: 1 / -1; }
 .queue-machine-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.queue-machine-heading { min-width: 0; }
-.queue-machine-title { display: flex; min-width: 0; min-height: 36px; margin: -4px 0; padding: 4px 2px 4px 0; align-items: center; gap: 3px; border: 0; border-radius: 6px; color: var(--queue-text); background: transparent; text-align: left; cursor: pointer; }
-.queue-machine-title svg { flex: 0 0 auto; color: var(--queue-tertiary); transition: transform .16s ease, color .16s ease; }
-.queue-machine-title:hover svg, .queue-machine-title:focus-visible svg { color: var(--queue-blue); transform: translateX(2px); }
-.queue-machine-header h2 { margin: 0; border: 0; font-size: 19px; font-weight: 620; line-height: 1.35; letter-spacing: 0; }
-.queue-machine-header p { margin: 3px 0 0; color: var(--queue-secondary); font-size: 11px; line-height: 1.45; }
+.queue-machine-header > button { display: flex; min-width: 0; min-height: 48px; margin: -7px 0 -7px -7px; padding: 7px; align-items: center; flex: 1 1 auto; gap: 8px; border: 0; border-radius: 8px; color: var(--queue-text); background: transparent; text-align: left; cursor: pointer; }
+.queue-machine-header > button:hover { background: var(--queue-position); }
+.queue-machine-header > button > span { display: block; min-width: 0; flex: 1 1 auto; }
+.queue-machine-header > button > svg { flex: 0 0 auto; color: var(--queue-tertiary); }
+.queue-machine-title, .queue-machine-summary { display: block; }
+.queue-machine-title { overflow-wrap: anywhere; font-size: 19px; font-weight: 620; line-height: 1.35; }
+.queue-machine-summary { margin-top: 3px; color: var(--queue-secondary); font-size: 11px; line-height: 1.45; }
 .queue-machine-state { padding: 5px 8px; flex: 0 0 auto; border-radius: 6px; color: var(--queue-orange); background: var(--queue-soft-orange); font-size: 10px; font-weight: 650; }
 .queue-machine-message { display: flex; min-height: 142px; padding: 24px 8px 8px; justify-content: center; flex-direction: column; }
 .queue-machine-message.is-stopped { min-height: 0; margin-top: 12px; padding: 12px 13px; border-radius: 9px; background: color-mix(in srgb, var(--queue-soft-orange) 82%, var(--queue-position)); }
@@ -2614,7 +2863,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-logs-header h2 { margin: 0; border: 0; font-size: 20px; font-weight: 630; letter-spacing: 0; }
 .queue-logs-header p { margin: 4px 0 0; color: var(--queue-secondary); font-size: 11px; line-height: 1.5; }
 .queue-log-filter-groups { display: flex; min-width: 0; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
-.queue-log-filters { display: flex; padding: 3px; flex: 0 0 auto; border-radius: 9px; background: var(--queue-position); }
+.queue-log-filters { display: flex; padding: 3px; flex: 0 1 auto; flex-wrap: wrap; border-radius: 9px; background: var(--queue-position); }
 .queue-log-filters button { min-height: 30px; padding: 0 9px; border: 0; border-radius: 7px; color: var(--queue-secondary); background: transparent; cursor: pointer; font-size: 10px; transition: color .16s ease, background .16s ease, box-shadow .16s ease; }
 .queue-log-filters button.active { color: var(--queue-text); background: var(--queue-card); box-shadow: 0 1px 3px rgba(0, 0, 0, .08); }
 .queue-log-list { margin: 17px 0 0; padding: 0; list-style: none; border-top: 1px solid var(--queue-separator); }
@@ -2686,7 +2935,11 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-online-field input::placeholder { color: var(--queue-tertiary); }
 .queue-online-options { min-width: 0; margin: 0; padding: 0; border: 0; }
 .queue-online-options legend { margin-bottom: 7px; padding: 0; }
-.queue-online-machine-options, .queue-online-preference-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.queue-online-machine-groups { display: grid; gap: 11px; }
+.queue-online-machine-groups section { min-width: 0; }
+.queue-online-machine-groups h3 { margin: 0 0 6px; border: 0; color: var(--queue-tertiary); font-size: 9px; font-weight: 620; line-height: 1.4; }
+.queue-online-machine-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(130px, 100%), 1fr)); gap: 8px; }
+.queue-online-preference-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .queue-online-machine-options button, .queue-online-preference-options button { display: flex; min-width: 0; min-height: 62px; padding: 10px 11px; justify-content: center; flex-direction: column; border: 1px solid var(--queue-separator); border-radius: 9px; color: var(--queue-text); background: var(--queue-position); text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .12s ease; }
 .queue-online-machine-options button:active:not(:disabled), .queue-online-preference-options button:active { transform: scale(.99); }
 .queue-online-machine-options button.active, .queue-online-preference-options button.active { border-color: color-mix(in srgb, var(--queue-blue) 62%, var(--queue-separator)); background: var(--queue-soft-blue); }
@@ -2719,7 +2972,6 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-online-capacity-notice strong { font-size: 11px; font-weight: 640; line-height: 1.45; }
 .queue-online-capacity-notice span { margin-top: 2px; color: var(--queue-secondary); font-size: 10px; line-height: 1.55; }
 .queue-machine-metadata { margin-top: 16px; }
-.queue-machine-capacity-detail { margin: 14px 0 0; padding: 11px 12px; border-left: 3px solid var(--queue-blue); color: var(--queue-secondary); background: var(--queue-soft-blue); font-size: 11px; line-height: 1.6; }
 .queue-online-error { margin: -4px 0 0; padding: 9px 10px; border-radius: 7px; color: var(--queue-red); background: var(--queue-soft-red); font-size: 10px; line-height: 1.5; }
 .queue-online-primary, .queue-online-secondary { display: flex; width: 100%; min-height: 44px; padding: 0 14px; align-items: center; justify-content: center; border: 0; border-radius: 9px; cursor: pointer; font-size: 12px; font-weight: 600; }
 .queue-online-primary { color: #fff; background: var(--queue-blue); }
@@ -2770,6 +3022,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 
 @media (min-width: 1100px) {
   .queue-machine-list { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  .queue-machine-list.is-single { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 619px) {

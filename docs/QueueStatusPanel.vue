@@ -1594,6 +1594,7 @@ function invalidateOnlineJoinConfirmation(message) {
   onlineJoinStep.value = 'LOOKUP'
   onlineJoinProfile.value = null
   onlineJoinMachines.value = []
+  onlineJoinGroups.value = []
   onlineJoinExistingRegistration.value = null
   onlineJoinPreference.value = null
   onlineJoinCommandId.value = null
@@ -1716,8 +1717,6 @@ function backToOnlineLookup() {
   onlineJoinQueueId.value = null
   onlineJoinMachineConfigurationRevision.value = null
   onlineJoinCommandId.value = null
-  onlineJoinQueueId.value = null
-  onlineJoinMachineConfigurationRevision.value = null
   onlineJoinResultRegistrationId.value = null
   onlineJoinTerminalApplied.value = false
   onlineJoinError.value = ''
@@ -3009,6 +3008,12 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
   .queue-view-tabs { width: 190px; }
   .queue-system { width: auto; grid-template-columns: auto 1px minmax(92px, auto) 40px; }
   .queue-position-list { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  .queue-machine-list.is-single .queue-position-list {
+    grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+  }
+  .queue-machine-list.is-single .queue-position-list:has(> .queue-position:nth-child(2):last-child) {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .queue-position.is-playing { grid-column: 1 / -1; }
   .queue-position.is-playing .queue-registration-grid:has(> .queue-overtime):has(> .queue-registration + .queue-registration) {
     grid-template-columns: minmax(0, 1.25fr) repeat(2, minmax(0, 1fr));

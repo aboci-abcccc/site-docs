@@ -162,7 +162,12 @@ function readRememberedProfileId() {
   const item = document.cookie.split(';').map((part) => part.trim()).find((part) => (
     part.startsWith(`${PROFILE_COOKIE}=`)
   ))
-  return item ? decodeURIComponent(item.slice(PROFILE_COOKIE.length + 1)) : null
+  if (!item) return null
+  try {
+    return decodeURIComponent(item.slice(PROFILE_COOKIE.length + 1)) || null
+  } catch {
+    return null
+  }
 }
 
 function rememberProfile(profileId) {
@@ -171,6 +176,13 @@ function rememberProfile(profileId) {
   document.cookie = `${PROFILE_COOKIE}=${encodeURIComponent(profileId)}` +
     `; Max-Age=31536000; Path=/; SameSite=Lax${secure}`
   rememberedProfileId.value = profileId
+}
+
+function forgetRememberedProfile() {
+  if (typeof document === 'undefined') return
+  const secure = window.location.protocol === 'https:' ? '; Secure' : ''
+  document.cookie = `${PROFILE_COOKIE}=; Max-Age=0; Path=/; SameSite=Lax${secure}`
+  rememberedProfileId.value = null
 }
 
 async function requestJson(url, options = {}) {
@@ -223,7 +235,16 @@ async function initialize() {
       applyCommandResult(result)
       return
     }
-    await loadProfiles('')
+    const loaded = await loadProfiles('')
+    if (!loaded) return
+    const rememberedProfile = profiles.value.find((profile) => (
+      profile.profileId === rememberedProfileId.value
+    ))
+    if (rememberedProfile) {
+      selectProfile(rememberedProfile)
+      return
+    }
+    if (rememberedProfileId.value) forgetRememberedProfile()
     step.value = 'SELECT'
   } catch (error) {
     if (isTemporaryRequestError(error)) {
@@ -257,10 +278,12 @@ async function loadProfiles(query) {
       rememberProfile(canonicalRememberedProfile)
     }
     errorDetail.value = ''
+    return true
   } catch (error) {
     if (sequence !== searchSequence) return
     errorDetail.value = error?.message || '玩家资料库暂时无法读取。'
     if (!session.value) step.value = 'ERROR'
+    return false
   } finally {
     if (sequence === searchSequence) searching.value = false
   }
@@ -530,7 +553,7 @@ onBeforeUnmount(() => {
             <div>
               <span>现场登记</span>
               <h2>选择玩家资料</h2>
-              <p>从完整的玩家资料库中选择。本浏览器会记住最后成功使用的资料，下一次仍可改选其他玩家。</p>
+              <p>从完整的玩家资料库中选择。本浏览器会记住最后成功使用的资料，下次直接进入确认页面，仍可返回改选其他玩家。</p>
             </div>
             <button type="button" @click="beginNewProfile"><UserPlus :size="17" aria-hidden="true" />新建玩家资料</button>
           </section>

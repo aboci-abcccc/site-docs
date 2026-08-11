@@ -3,6 +3,7 @@ import {
   ChevronRight,
   CircleCheck,
   History,
+  Info,
   MapPin,
   RefreshCw,
   TriangleAlert,
@@ -16,9 +17,12 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import MobileRegistrationFlow from './MobileRegistrationFlow.vue'
 import { normalizeMachineConfiguration } from './machineConfiguration.js'
 
-const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL || 'https://abcccc.top/api/queue-status'
+const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL ||
+  (typeof window !== 'undefined' ? `${window.location.origin}/api/queue-status` : '/api/queue-status')
 const QUEUE_LOG_API_URL = import.meta.env.VITE_QUEUE_LOG_API_URL ||
   QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'queue-logs')
+const QUEUE_VERSIONS_API_URL = import.meta.env.VITE_QUEUE_VERSIONS_API_URL ||
+  QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'queue-versions')
 const QUEUE_ONLINE_PROFILE_API_URL = import.meta.env.VITE_QUEUE_ONLINE_PROFILE_API_URL ||
   QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'queue-online/profile')
 const QUEUE_ONLINE_JOIN_API_URL = import.meta.env.VITE_QUEUE_ONLINE_JOIN_API_URL ||
@@ -78,6 +82,10 @@ const refreshing = ref(false)
 const loadError = ref(false)
 const activeView = ref('queue')
 const selectedDetail = ref(null)
+const versionDialogVisible = ref(false)
+const clientVersions = ref(null)
+const clientVersionsLoading = ref(false)
+const clientVersionsError = ref(false)
 const pendingSelfRegistration = ref(null)
 const markedSelf = ref(null)
 const currentLogs = ref([])
@@ -134,6 +142,36 @@ const activeMachineGroup = computed(() => (
 ))
 
 const visibleMachines = computed(() => activeMachineGroup.value?.machines ?? machines.value)
+
+const clientVersionRows = computed(() => {
+  const definitions = [
+    { key: 'terminal', name: '现场终端' },
+    { key: 'website', name: '队列网站' },
+    { key: 'bot', name: 'QQ Bot' }
+  ]
+  return definitions.map((definition) => {
+    const source = clientVersions.value?.components?.[definition.key]
+    const status = ['LATEST', 'UPDATE_AVAILABLE', 'AHEAD'].includes(source?.status)
+      ? source.status
+      : 'UNKNOWN'
+    return {
+      key: definition.key,
+      name: typeof source?.name === 'string' && source.name.trim()
+        ? source.name.trim()
+        : definition.name,
+      currentVersion: normalizeClientVersion(source?.current_version),
+      latestVersion: normalizeClientVersion(source?.latest_version),
+      updatedAt: source?.updated_at ?? null,
+      status,
+      statusLabel: {
+        LATEST: '已是最新版本',
+        UPDATE_AVAILABLE: '有新版本',
+        AHEAD: '高于公开版本',
+        UNKNOWN: '暂时无法确认'
+      }[status]
+    }
+  })
+})
 
 const snapshotAgeMillis = computed(() => {
   const date = parseDate(capturedAt.value)
@@ -789,6 +827,51 @@ async function loadQueue(silent = false) {
     loading.value = false
     refreshing.value = false
   }
+}
+
+function normalizeClientVersion(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (
+    trimmed.length > 32 ||
+    !/^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(trimmed)
+  ) return null
+  return trimmed.startsWith('v') ? trimmed.slice(1) : trimmed
+}
+
+async function loadClientVersions() {
+  if (clientVersionsLoading.value) return
+  clientVersionsLoading.value = true
+  clientVersionsError.value = false
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), 5000)
+  try {
+    const response = await fetch(QUEUE_VERSIONS_API_URL, {
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const data = await response.json()
+    if (!data?.components || typeof data.components !== 'object') {
+      throw new Error('Invalid version response')
+    }
+    clientVersions.value = data
+  } catch {
+    clientVersionsError.value = true
+  } finally {
+    window.clearTimeout(timeout)
+    clientVersionsLoading.value = false
+  }
+}
+
+function openVersionDialog() {
+  versionDialogVisible.value = true
+  loadClientVersions()
+}
+
+function closeVersionDialog() {
+  versionDialogVisible.value = false
 }
 
 function normalizeLogEvent(source) {
@@ -1558,6 +1641,7 @@ async function readJsonResponse(response) {
   if (!response.ok) {
     const error = new Error(data?.error || `服务器返回 HTTP ${response.status}`)
     error.code = data?.code || null
+    error.status = response.status
     throw error
   }
   return data || {}
@@ -1882,6 +1966,11 @@ async function submitOnlineJoin() {
     invalidateOnlineJoinConfirmation('现场队列或机台配置已更新，请重新查询玩家资料后再提交。')
     return
   }
+  const currentMachine = machines.value.find((candidate) => candidate.id === machine.id)
+  if (!currentMachine || currentMachine.stableId !== machine.stableId) {
+    invalidateOnlineJoinConfirmation('所选机台已经变化，请重新查询玩家资料后再提交。')
+    return
+  }
   const preference = machine.capacity === 1
     ? 'SOLO'
     : onlineJoinNeedsPreference.value
@@ -1899,20 +1988,32 @@ async function submitOnlineJoin() {
   onlineJoinLoading.value = true
   onlineJoinError.value = ''
   try {
-    const response = await fetch(QUEUE_ONLINE_JOIN_API_URL, {
+    const requestPayload = {
+      request_id: requestId,
+      qq: profile.qqNumber,
+      machine_id: machine.id,
+      preference,
+      expected_queue_id: onlineJoinQueueId.value,
+      expected_machine_configuration_revision: onlineJoinMachineConfigurationRevision.value,
+      expected_machine_stable_id: machine.stableId
+    }
+    const sendRequest = (payload) => fetch(QUEUE_ONLINE_JOIN_API_URL, {
       method: 'POST',
       cache: 'no-store',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        request_id: requestId,
-        qq: profile.qqNumber,
-        machine_id: machine.id,
-        preference,
-        expected_queue_id: onlineJoinQueueId.value,
-        expected_machine_configuration_revision: onlineJoinMachineConfigurationRevision.value
-      })
+      body: JSON.stringify(payload)
     })
-    const command = await readJsonResponse(response)
+    let command
+    try {
+      command = await readJsonResponse(await sendRequest(requestPayload))
+    } catch (error) {
+      if (
+        error?.status !== 400 ||
+        error?.message !== '请求包含不支持的线上登记字段'
+      ) throw error
+      const { expected_machine_stable_id: _ignored, ...legacyPayload } = requestPayload
+      command = await readJsonResponse(await sendRequest(legacyPayload))
+    }
     onlineJoinCommandId.value = command.command_id || requestId
     onlineJoinStep.value = 'PENDING'
     if (command.status === 'APPLIED' || command.status === 'REJECTED') {
@@ -1936,6 +2037,7 @@ async function submitOnlineJoin() {
 function handleKeydown(event) {
   if (event.key !== 'Escape') return
   if (onlineJoinVisible.value) closeOnlineJoin()
+  else if (versionDialogVisible.value) closeVersionDialog()
   else if (pendingSelfRegistration.value) pendingSelfRegistration.value = null
   else closeDetail()
 }
@@ -1990,23 +2092,36 @@ onBeforeUnmount(() => {
         </div>
         <div class="queue-system">
           <time :datetime="capturedAt || undefined">{{ capturedTimeText }}</time>
-          <template v-if="availability">
-            <span class="queue-system-divider" aria-hidden="true"></span>
-            <span class="queue-availability" :class="`is-${availability.tone}`">
-              <span aria-hidden="true"></span>
-              {{ availability.label }}
-            </span>
-          </template>
-          <button
-            class="queue-refresh"
-            type="button"
-            :disabled="refreshing"
-            aria-label="刷新排队状态"
-            title="刷新排队状态"
-            @click="activeView === 'logs' ? loadCurrentLogs(true) : loadQueue()"
-          >
-            <RefreshCw :size="18" :class="{ spinning: refreshing || logsLoading }" aria-hidden="true" />
-          </button>
+          <div class="queue-system-status">
+            <template v-if="availability">
+              <span class="queue-system-divider" aria-hidden="true"></span>
+              <span class="queue-availability" :class="`is-${availability.tone}`">
+                <span aria-hidden="true"></span>
+                {{ availability.label }}
+              </span>
+            </template>
+          </div>
+          <div class="queue-system-actions">
+            <button
+              class="queue-version-button"
+              type="button"
+              aria-label="查看三端版本信息"
+              title="版本信息"
+              @click="openVersionDialog"
+            >
+              <Info :size="18" aria-hidden="true" />
+            </button>
+            <button
+              class="queue-refresh"
+              type="button"
+              :disabled="refreshing"
+              aria-label="刷新排队状态"
+              title="刷新排队状态"
+              @click="activeView === 'logs' ? loadCurrentLogs(true) : loadQueue()"
+            >
+              <RefreshCw :size="18" :class="{ spinning: refreshing || logsLoading }" aria-hidden="true" />
+            </button>
+          </div>
         </div>
       </div>
     </header>
@@ -2091,9 +2206,12 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <nav v-if="configuredMachineGroups.length > 1" class="queue-machine-groups" aria-label="机台分组">
+      <nav v-if="configuredMachineGroups.length > 1" class="queue-machine-groups"
+        :class="{ 'is-pair': configuredMachineGroups.length === 2 }" aria-label="机台分组">
         <button v-for="group in configuredMachineGroups" :key="group.id" type="button"
-          :class="{ active: activeMachineGroup?.id === group.id }" @click="selectMachineGroup(group.id)">
+          :class="{ active: activeMachineGroup?.id === group.id }"
+          :aria-pressed="activeMachineGroup?.id === group.id" :title="group.name"
+          @click="selectMachineGroup(group.id)">
           <span>{{ group.name }}</span>
           <small>{{ group.machines.map((machine) => machine.id).join('、') }}</small>
         </button>
@@ -2282,6 +2400,53 @@ onBeforeUnmount(() => {
     </section>
 
     <Teleport to="body">
+      <Transition name="queue-dialog">
+        <div v-if="versionDialogVisible" class="queue-detail-backdrop" @click.self="closeVersionDialog">
+          <section class="queue-detail-dialog queue-version-dialog" role="dialog" aria-modal="true"
+            aria-label="三端版本信息">
+            <header class="queue-detail-header">
+              <div>
+                <h2>版本信息</h2>
+                <p>现场终端、队列网站和 QQ Bot</p>
+              </div>
+              <button type="button" aria-label="关闭版本信息" title="关闭" @click="closeVersionDialog">
+                <X :size="20" aria-hidden="true" />
+              </button>
+            </header>
+
+            <div v-if="clientVersionsLoading && !clientVersions" class="queue-version-loading" aria-live="polite">
+              <RefreshCw :size="20" class="spinning" aria-hidden="true" />
+              <span>正在读取版本信息</span>
+            </div>
+            <template v-else>
+              <p v-if="clientVersionsError" class="queue-version-error" role="status">
+                {{ clientVersions ? '更新失败，以下为上次读取的结果。' : '暂时无法读取版本信息，请稍后重试。' }}
+              </p>
+              <div class="queue-version-list">
+                <section v-for="row in clientVersionRows" :key="row.key">
+                  <header>
+                    <strong>{{ row.name }}</strong>
+                    <span :class="`is-${row.status.toLowerCase().replace('_', '-')}`">
+                      {{ row.statusLabel }}
+                    </span>
+                  </header>
+                  <dl>
+                    <div><dt>当前版本</dt><dd>{{ row.currentVersion || '未知' }}</dd></div>
+                    <div><dt>最新版本</dt><dd>{{ row.latestVersion || '未知' }}</dd></div>
+                    <div><dt>最后上报</dt><dd>{{ fullTimeText(row.updatedAt, '尚未上报') }}</dd></div>
+                  </dl>
+                </section>
+              </div>
+              <button v-if="clientVersionsError" class="queue-detail-secondary" type="button"
+                :disabled="clientVersionsLoading" @click="loadClientVersions">
+                <RefreshCw :size="17" :class="{ spinning: clientVersionsLoading }" aria-hidden="true" />
+                重新获取
+              </button>
+            </template>
+          </section>
+        </div>
+      </Transition>
+
       <Transition name="queue-dialog">
         <div v-if="onlineJoinVisible" class="queue-detail-backdrop" @click.self="closeOnlineJoin">
           <section class="queue-detail-dialog queue-online-dialog" role="dialog" aria-modal="true"
@@ -2732,16 +2897,18 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-view-tabs { display: grid; width: 100%; padding: 3px; grid-template-columns: 1fr 1fr; border-radius: 10px; background: color-mix(in srgb, var(--queue-separator) 42%, transparent); }
 .queue-view-tabs button { display: flex; min-height: 36px; align-items: center; justify-content: center; gap: 6px; border: 0; border-radius: 8px; color: var(--queue-secondary); background: transparent; cursor: pointer; font-size: 12px; transition: color .16s ease, background .16s ease, box-shadow .16s ease; }
 .queue-view-tabs button.active { color: var(--queue-text); background: var(--queue-card); box-shadow: 0 1px 3px rgba(0, 0, 0, .08); }
-.queue-system { display: grid; width: 100%; min-width: 0; grid-template-columns: auto 1px minmax(0, 1fr) 40px; align-items: center; gap: 10px; }
+.queue-system { display: grid; width: 100%; min-width: 0; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; }
 .queue-system time { font-size: 16px; font-weight: 570; font-variant-numeric: tabular-nums; }
+.queue-system-status { display: flex; min-width: 0; align-items: center; gap: 10px; }
 .queue-system-divider { width: 1px; height: 16px; background: var(--queue-separator); }
 .queue-availability { display: flex; min-width: 0; align-items: center; gap: 7px; color: var(--queue-secondary); font-size: 12px; line-height: 1.35; }
 .queue-availability > span { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #8e8e93; }
 .queue-availability.is-closed > span { background: #ff9500; }
 .queue-availability.is-outside > span { background: #ff3b30; }
-.queue-refresh { display: grid; width: 40px; height: 40px; padding: 0; place-items: center; border: 1px solid color-mix(in srgb, var(--queue-separator) 72%, transparent); border-radius: 50%; color: var(--queue-text); background: var(--queue-card); cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .12s ease; }
+.queue-system-actions { display: flex; align-items: center; gap: 6px; }
+.queue-version-button, .queue-refresh { display: grid; width: 40px; height: 40px; padding: 0; place-items: center; border: 1px solid color-mix(in srgb, var(--queue-separator) 72%, transparent); border-radius: 50%; color: var(--queue-text); background: var(--queue-card); cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .12s ease; }
 .queue-refresh:disabled { opacity: .55; }
-.queue-refresh:active:not(:disabled) { transform: scale(.95); }
+.queue-version-button:active, .queue-refresh:active:not(:disabled) { transform: scale(.95); }
 .queue-refresh:focus-visible, button:focus-visible, [role='button']:focus-visible { outline: 2px solid var(--queue-blue); outline-offset: 2px; }
 .spinning { animation: queue-spin .8s linear infinite; }
 .queue-test-notice { display: flex; margin: 0 0 16px; padding: 10px 12px; align-items: center; gap: 8px; border-left: 3px solid #ff9500; color: var(--queue-orange); background: color-mix(in srgb, var(--queue-soft-orange) 68%, var(--queue-card)); }
@@ -2796,9 +2963,12 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-natural-notice span { margin-top: 2px; font-size: 11px; line-height: 1.5; }
 
 .queue-machine-groups { display: flex; min-width: 0; margin: 0 0 14px; padding: 3px; overflow-x: auto; gap: 3px; border-radius: 10px; background: color-mix(in srgb, var(--queue-separator) 42%, transparent); scrollbar-width: thin; }
+.queue-machine-groups.is-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: hidden; }
 .queue-machine-groups button { display: flex; min-width: 112px; min-height: 42px; padding: 6px 12px; align-items: flex-start; justify-content: center; flex-direction: column; border: 0; border-radius: 8px; color: var(--queue-secondary); background: transparent; cursor: pointer; white-space: nowrap; }
+.queue-machine-groups.is-pair button { width: 100%; min-width: 0; align-items: center; text-align: center; }
 .queue-machine-groups button.active { color: var(--queue-text); background: var(--queue-card); box-shadow: 0 1px 3px rgba(0, 0, 0, .08); }
 .queue-machine-groups span, .queue-machine-groups small { display: block; }
+.queue-machine-groups span, .queue-machine-groups small { width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .queue-machine-groups span { font-size: 11px; font-weight: 620; }
 .queue-machine-groups small { margin-top: 1px; color: var(--queue-tertiary); font-size: 9px; }
 .queue-machine-list { display: grid; gap: 16px; }
@@ -2925,6 +3095,23 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-detail-secondary { color: var(--queue-text); background: var(--queue-position); }
 .queue-detail-privacy { max-width: 34em; margin: 8px auto 0; color: var(--queue-tertiary); font-size: 10px; line-height: 1.5; text-align: center; text-wrap: balance; }
 
+.queue-version-dialog { width: min(100%, 460px); }
+.queue-version-loading { display: flex; min-height: 220px; align-items: center; justify-content: center; flex-direction: column; gap: 10px; color: var(--queue-secondary); font-size: 11px; }
+.queue-version-error { margin: 16px 0 0; padding: 10px 11px; border-left: 3px solid var(--queue-orange); color: var(--queue-secondary); background: var(--queue-soft-orange); font-size: 10px; line-height: 1.55; }
+.queue-version-list { margin-top: 14px; border-top: 1px solid var(--queue-separator); }
+.queue-version-list > section { padding: 13px 0; border-bottom: 1px solid var(--queue-separator); }
+.queue-version-list > section > header { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; }
+.queue-version-list > section > header strong { min-width: 0; overflow: hidden; font-size: 13px; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
+.queue-version-list > section > header span { padding: 4px 7px; flex: 0 0 auto; border-radius: 6px; color: var(--queue-secondary); background: var(--queue-position); font-size: 9px; font-weight: 620; }
+.queue-version-list > section > header span.is-latest { color: #248a3d; background: color-mix(in srgb, #34c759 12%, var(--queue-card)); }
+.queue-version-list > section > header span.is-update-available { color: var(--queue-orange); background: var(--queue-soft-orange); }
+.queue-version-list > section > header span.is-ahead { color: var(--queue-blue); background: var(--queue-soft-blue); }
+.queue-version-list dl { display: grid; margin: 9px 0 0; gap: 5px; }
+.queue-version-list dl > div { display: grid; grid-template-columns: minmax(74px, auto) minmax(0, 1fr); gap: 14px; }
+.queue-version-list dt, .queue-version-list dd { margin: 0; font-size: 10px; line-height: 1.45; }
+.queue-version-list dt { color: var(--queue-tertiary); }
+.queue-version-list dd { overflow-wrap: anywhere; text-align: right; font-variant-numeric: tabular-nums; }
+
 .queue-online-dialog { width: min(100%, 520px); }
 .queue-online-form { display: grid; margin-top: 18px; gap: 16px; }
 .queue-online-field { display: grid; gap: 7px; }
@@ -3006,7 +3193,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
   .queue-header { align-items: flex-end; flex-direction: row; justify-content: space-between; }
   .queue-toolbar { width: auto; align-items: center; flex-direction: row; }
   .queue-view-tabs { width: 190px; }
-  .queue-system { width: auto; grid-template-columns: auto 1px minmax(92px, auto) 40px; }
+  .queue-system { width: auto; grid-template-columns: auto minmax(92px, auto) auto; }
   .queue-position-list { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
   .queue-machine-list.is-single .queue-position-list {
     grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));

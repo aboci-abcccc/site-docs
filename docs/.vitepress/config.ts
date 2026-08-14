@@ -124,7 +124,7 @@ export default defineConfig({
     [
       "script",
       {},
-      `if (location.hostname === "maimai.abcccc.top" && (location.pathname === "/" || location.pathname === "/index.html")) location.replace("/maimai-board")`,
+      `if (location.hostname === "maimai.abcccc.top" && (location.pathname === "/" || location.pathname === "/index.html")) location.replace("https://abcccc.top/maimai-board")`,
     ],
     [
       "link",

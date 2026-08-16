@@ -17,10 +17,12 @@ import {
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import MobileRegistrationFlow from './MobileRegistrationFlow.vue'
 import PlayerAccountDialog from './PlayerAccountDialog.vue'
-import { compactMiddleDots, normalizeMachineConfiguration } from './machineConfiguration.js'
+import { compactMiddleDots, formatMiddleDots, normalizeMachineConfiguration } from './machineConfiguration.js'
 
 const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL ||
   (typeof window !== 'undefined' ? `${window.location.origin}/api/queue-status` : '/api/queue-status')
+const PLAYER_ACCOUNT_API_URL = import.meta.env.VITE_PLAYER_ACCOUNT_API_URL ||
+  QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'player-account')
 const QUEUE_LOG_API_URL = import.meta.env.VITE_QUEUE_LOG_API_URL ||
   QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'queue-logs')
 const QUEUE_VERSIONS_API_URL = import.meta.env.VITE_QUEUE_VERSIONS_API_URL ||
@@ -41,14 +43,14 @@ const DEFAULT_MACHINE_GROUP_ID = '00000000000000000000000000000001'
 const defaultMachineDefinitions = SUPPORTED_MACHINE_IDS.map((id, index) => ({
   id,
   name: index === 0
-    ? '左侧·机台 A'
+    ? '左侧 · 机台 A'
     : index === 1
-      ? '右侧·机台 B'
+      ? '右侧 · 机台 B'
       : index === 2
-        ? '中间左侧·机台 C'
+        ? '中间左侧 · 机台 C'
         : index === 3
-           ? '中间右侧·机台 D'
-           : `第 ${index + 1} 台·机台 ${id}`
+           ? '中间右侧 · 机台 D'
+           : `第 ${index + 1} 台 · 机台 ${id}`
 }))
 const logSourceDefinitions = [
   { value: 'ALL', label: '全部来源' },
@@ -85,12 +87,22 @@ const refreshing = ref(false)
 const loadError = ref(false)
 const activeView = ref('queue')
 const selectedDetail = ref(null)
+const detailActionMode = ref(null)
+const detailActionTargetMachineId = ref('')
+const detailActionPreference = ref('SOLO')
+const detailActionSubmitting = ref(false)
+const detailActionError = ref('')
+const detailActionNotice = ref('')
 const versionDialogVisible = ref(false)
 const clientVersions = ref(null)
 const clientVersionsLoading = ref(false)
 const clientVersionsError = ref(false)
 const pendingSelfRegistration = ref(null)
 const markedSelf = ref(null)
+const playerAccount = ref(null)
+const playerAccountQueueState = ref(null)
+const accountSelfIdentity = ref(null)
+const playerAccountSessionReady = ref(false)
 const currentLogs = ref([])
 const currentLogsQueueId = ref(null)
 const currentLogsNextCursor = ref(null)
@@ -104,6 +116,7 @@ const selfStorageAvailable = ref(true)
 const currentTime = ref(Date.now())
 const onlineJoinVisible = ref(false)
 const onlineJoinStep = ref('LOOKUP')
+const onlineJoinAudience = ref('OTHER')
 const onlineJoinQq = ref('')
 const onlineJoinMachineId = ref('A')
 const onlineJoinProfile = ref(null)
@@ -122,9 +135,11 @@ const onlineJoinTerminalApplied = ref(false)
 const mobileRegistrationToken = ref('')
 const playerAccountBindingToken = ref('')
 const playerAccountDialogVisible = ref(false)
+const playerAccountFocusRegistrationId = ref('')
 let refreshTimer
 let clockTimer
 let onlineCommandTimer
+let detailActionTimer
 
 const totalRegistrationCount = computed(() => (
   machines.value.reduce((total, machine) => total + machine.registrationCount, 0)
@@ -356,6 +371,18 @@ const registrationLocations = computed(() => {
 })
 
 const markedSelfResolution = computed(() => {
+  // Logged-in accounts are resolved only by server-issued registration IDs.
+  // QQ/nickname matching remains available only for the legacy local marker.
+  if (playerAccount.value) {
+    const accountIds = new Set(accountRegistrationIds())
+    const accountMatches = registrationLocations.value.filter((location) => (
+      accountIds.has(location.registration.registrationId)
+    ))
+    return {
+      location: accountMatches.length === 1 ? accountMatches[0] : null,
+      ambiguous: accountMatches.length > 1 || accountRegistrationIds().length > 1
+    }
+  }
   const identity = markedSelf.value
   if (!identity) return { location: null, ambiguous: false }
 
@@ -386,6 +413,8 @@ const markedSelfResolution = computed(() => {
 
 const markedSelfLocation = computed(() => markedSelfResolution.value.location)
 const markedSelfAmbiguous = computed(() => markedSelfResolution.value.ambiguous)
+const activeSelfIdentity = computed(() => playerAccount.value ? accountSelfIdentity.value : markedSelf.value)
+const accountSessionActive = computed(() => Boolean(playerAccount.value))
 
 const markedSelfLastEvent = computed(() => {
   const registrationIds = knownSelfRegistrationIds()
@@ -632,7 +661,7 @@ function normalizeMachine(definition, source) {
 
   return {
     ...definition,
-    name: compactMiddleDots(String(source.name || definition.name)),
+    name: formatMiddleDots(String(source.name || definition.name)),
     stableId: definition.stableId,
     groupId: definition.groupId,
     remark: configuration.remark,
@@ -843,6 +872,7 @@ async function loadQueue(silent = false) {
     })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     applyServerData(await response.json())
+    if (playerAccount.value) await refreshLoggedInPlayerQueue()
     await refreshMarkedSelfLogs()
     if (activeView.value === 'logs') await loadCurrentLogs(true)
   } catch {
@@ -899,12 +929,102 @@ function closeVersionDialog() {
   versionDialogVisible.value = false
 }
 
-function openPlayerAccount() {
+function syncAccountSelfIdentity() {
+  const account = playerAccount.value
+  const state = playerAccountQueueState.value
+  if (!account || !state) {
+    accountSelfIdentity.value = null
+    return
+  }
+  const registrations = Array.isArray(state.registrations) ? state.registrations : []
+  const profile = account.profile || {}
+  const registrationIds = registrations
+    .map((registration) => registration?.registration_id)
+    .filter((registrationId) => typeof registrationId === 'string' && registrationId)
+  const onlyRegistration = registrations.length === 1 ? registrations[0] : null
+  accountSelfIdentity.value = {
+    isAccount: true,
+    queueId: state.queue?.queue_id || queueId.value,
+    registrationId: onlyRegistration?.registration_id || null,
+    registrationIds,
+    displayId: onlyRegistration?.display_id || profile.nickname || '已登录玩家',
+    qqNumber: normalizeQqNumber(profile.qq_number),
+    machineId: onlyRegistration?.machine_id || null
+  }
+}
+
+function handlePlayerAccountSession(account) {
+  const currentProfile = playerAccount.value?.profile || null
+  const nextProfile = account?.profile || null
+  const profileKey = (profile) => profile?.public_player_id || profile?.qq_number || ''
+  const accountChanged = profileKey(currentProfile) !== profileKey(nextProfile)
+  playerAccount.value = account || null
+  if (!account) {
+    playerAccountQueueState.value = null
+    accountSelfIdentity.value = null
+    markedSelfLogs.value = []
+    return
+  }
+  if (accountChanged) {
+    playerAccountQueueState.value = null
+    accountSelfIdentity.value = null
+  }
+  syncAccountSelfIdentity()
+}
+
+function handlePlayerAccountQueueState(state) {
+  playerAccountQueueState.value = state || null
+  syncAccountSelfIdentity()
+}
+
+async function refreshLoggedInPlayerQueue() {
+  if (!playerAccount.value) return
+  try {
+    const response = await fetch(`${PLAYER_ACCOUNT_API_URL}/queue`, {
+      credentials: 'include',
+      cache: 'no-store',
+      headers: { Accept: 'application/json' }
+    })
+    if (response.status === 401) {
+      handlePlayerAccountSession(null)
+      return
+    }
+    if (!response.ok) return
+    handlePlayerAccountQueueState(await response.json())
+  } catch {
+    // The public queue remains usable if the optional account refresh fails.
+  }
+}
+
+async function refreshLoggedInPlayerSession() {
+  if (playerAccountBindingToken.value) return
+  try {
+    const response = await fetch(PLAYER_ACCOUNT_API_URL, {
+      credentials: 'include',
+      cache: 'no-store',
+      headers: { Accept: 'application/json' }
+    })
+    if (response.status === 401) return
+    if (!response.ok) return
+    const payload = await response.json()
+    if (!payload?.account) return
+    handlePlayerAccountSession(payload.account)
+    await refreshLoggedInPlayerQueue()
+  } catch {
+    // Account detection is best effort and must never block queue status.
+  } finally {
+    playerAccountSessionReady.value = true
+  }
+}
+
+function openPlayerAccount(focusRegistrationId = '') {
+  playerAccountFocusRegistrationId.value = focusRegistrationId || ''
   playerAccountDialogVisible.value = true
 }
 
 function closePlayerAccount() {
   playerAccountDialogVisible.value = false
+  playerAccountFocusRegistrationId.value = ''
   if (playerAccountBindingToken.value) {
     playerAccountBindingToken.value = ''
     const url = new URL(window.location.href)
@@ -929,12 +1049,12 @@ function normalizeLogEvent(source) {
     machineStableId: normalizeInternalId(
       source?.machine_stable_id ?? source?.machineStableId
     ),
-    machineName: compactMiddleDots(
+    machineName: formatMiddleDots(
       String(source?.machine_name ?? source?.machineName ?? '').trim()
     ) || null,
     type: String(source?.type || 'OTHER').toUpperCase(),
-    title: compactMiddleDots(String(source?.title || '队列已更新')),
-    detail: compactMiddleDots(String(source?.detail || '')),
+    title: formatMiddleDots(String(source?.title || '队列已更新')),
+    detail: formatMiddleDots(String(source?.detail || '')),
     operationSource: String(
       source?.operation_source ?? source?.operationSource ?? 'ON_SITE_TERMINAL'
     ).toUpperCase(),
@@ -997,14 +1117,19 @@ async function loadCurrentLogs(reset = true) {
 }
 
 async function refreshMarkedSelfLogs() {
-  const identity = markedSelf.value
+  if (playerAccount.value && !accountSelfIdentity.value) {
+    markedSelfLogs.value = []
+    return
+  }
+  const identity = accountSelfIdentity.value || markedSelf.value
   if (!identity?.queueId) {
     markedSelfLogs.value = []
     return
   }
   try {
     const result = await fetchLogs(identity.queueId, null, 100)
-    if (markedSelf.value?.queueId === identity.queueId) {
+    const trackedQueueId = accountSelfIdentity.value?.queueId || markedSelf.value?.queueId
+    if (trackedQueueId === identity.queueId) {
       markedSelfLogs.value = result.logs
       if (identity.queueId === currentLogsQueueId.value) {
         currentLogs.value = result.logs
@@ -1051,6 +1176,7 @@ function restoreMarkedSelf() {
 }
 
 function requestMarkAsSelf(registration) {
+  if (accountSessionActive.value) return
   if (!registration.registrationId || !queueId.value) return
   const nextIdentity = {
     queueId: queueId.value,
@@ -1123,9 +1249,22 @@ function isSameMarkedPlayer(first, second) {
   return normalizePlayerNickname(first?.displayId) === normalizePlayerNickname(second?.displayId)
 }
 
-function knownSelfRegistrationIds(identity = markedSelf.value) {
-  if (!identity) return []
-  return normalizeMarkedSelfIdentity(identity).registrationIds
+function accountRegistrationIds() {
+  return Array.isArray(playerAccountQueueState.value?.registrations)
+    ? playerAccountQueueState.value.registrations
+      .map((registration) => registration.registration_id)
+      .filter((registrationId) => typeof registrationId === 'string' && registrationId)
+    : []
+}
+
+function knownSelfRegistrationIds(identity = accountSelfIdentity.value || markedSelf.value) {
+  const accountIds = accountRegistrationIds()
+  if (playerAccount.value) return [...new Set(accountIds)]
+  if (!identity) return [...new Set(accountIds)]
+  return [...new Set([
+    ...accountIds,
+    ...normalizeMarkedSelfIdentity(identity).registrationIds
+  ])]
 }
 
 function normalizePlayerNickname(value) {
@@ -1161,7 +1300,8 @@ function reconcileSelectedDetail() {
       location.kind === 'PLAYING' ? null : location.estimate,
       location.registrations,
       location.commonPlayPreview,
-      location.kind === 'PLAYING'
+      location.kind === 'PLAYING',
+      true
     )
     return
   }
@@ -1178,6 +1318,7 @@ function reconcileSelectedDetail() {
 }
 
 function reconcileMarkedSelfIdentity() {
+  if (playerAccount.value) return
   const identity = markedSelf.value
   const location = markedSelfResolution.value.location
   if (!identity || !location?.registration.registrationId || !queueId.value) return
@@ -1213,8 +1354,13 @@ function clearMarkedSelf() {
 }
 
 function isMarkedRegistration(registration) {
+  if (accountRegistrationIds().includes(registration.registrationId)) return true
   return Boolean(markedSelfLocation.value?.registration.registrationId &&
     markedSelfLocation.value.registration.registrationId === registration.registrationId)
+}
+
+function isAccountRegistration(registration) {
+  return accountRegistrationIds().includes(registration.registrationId)
 }
 
 function stopReasonLabel(reason, detail = null) {
@@ -1235,7 +1381,7 @@ function stopReasonLabel(reason, detail = null) {
 function machineSummary(machine) {
   if (!machine.synced) return '尚未同步现场状态'
   const queueSummary = `${machine.waitingPositions.length} 个等待位置·${machine.registrationCount} 个登记`
-  if (!machine.operational) return `${queueSummary}·已停止使用`
+  if (!machine.operational) return formatMiddleDots(`${queueSummary}·已停止使用`)
   return machine.registrationCount > 0 ? queueSummary : '当前空闲'
 }
 
@@ -1298,7 +1444,7 @@ function positionLabel(machine, position, index) {
 function absenceLabel(registration) {
   if (registration.temporarilyAway) {
     return registration.temporaryAwaySkippedTurns > 0
-      ? `暂时离开·已轮空 ${registration.temporaryAwaySkippedTurns} 次`
+      ? `暂时离开 · 已轮空 ${registration.temporaryAwaySkippedTurns} 次`
       : '暂时离开'
   }
   if (registration.deferredOnce) return '暂缓一次'
@@ -1306,7 +1452,7 @@ function absenceLabel(registration) {
 }
 
 function registrationLabel(registration) {
-  return (registration.onlineRegistrationPendingCheckIn ? '线上登记·待签到' : null) ||
+  return (registration.onlineRegistrationPendingCheckIn ? '线上登记 · 待签到' : null) ||
     absenceLabel(registration) ||
     (registration.noShowCount > 0 ? `未到场 ${registration.noShowCount} 次` : null) ||
     (registration.fixedPair ? '固定组合' : null) ||
@@ -1359,8 +1505,8 @@ function registrationPartnerText(detail) {
 function noShowResultLabel(registration) {
   if (!registration.noShowCount) return null
   return registration.lastNoShowActionWasDefer
-    ? `未到场 ${registration.noShowCount} 次·上次处理：暂缓一次`
-    : `未到场 ${registration.noShowCount} 次·上次处理：移至队尾`
+    ? `未到场 ${registration.noShowCount} 次 · 上次处理：暂缓一次`
+    : `未到场 ${registration.noShowCount} 次 · 上次处理：移至队尾`
 }
 
 function fullTimeText(value, fallback = '尚无记录') {
@@ -1400,6 +1546,219 @@ function openMachineDetails(machine) {
   }
 }
 
+function resetDetailAction() {
+  if (detailActionTimer) window.clearTimeout(detailActionTimer)
+  detailActionTimer = null
+  detailActionMode.value = null
+  detailActionTargetMachineId.value = ''
+  detailActionPreference.value = 'SOLO'
+  detailActionSubmitting.value = false
+  detailActionError.value = ''
+  detailActionNotice.value = ''
+}
+
+function accountQueueRegistrationFor(registration) {
+  if (!registration?.registrationId) return null
+  return playerAccountQueueState.value?.registrations?.find((candidate) => (
+    candidate.registration_id === registration.registrationId
+  )) || null
+}
+
+function detailRegistrationAbsenceStatus(registration) {
+  if (registration?.deferred_once) return 'DEFER_ONE_ROUND'
+  if (registration?.temporarily_away) return 'TEMPORARILY_AWAY'
+  return 'NONE'
+}
+
+function detailActionPrompt(registration, mode) {
+  if (!registration) return null
+  const subject = registration.fixed_pair ? '固定组合的两份登记' : '这份登记'
+  if (mode === 'defer') {
+    return {
+      title: registration.fixed_pair ? '确认整组暂缓一次？' : '确认暂缓一次？',
+      detail: registration.position === 'PLAYING'
+        ? `${subject}会离开游玩位置并回到等待顺序前端。这次游玩机会会被跳过，原有顺序保持不变，随后自动解除暂缓。`
+        : `下一次轮到${subject}时不会进入游玩位置。${subject}会保持当前顺序，在跳过这次机会后自动解除暂缓。`,
+      note: '暂缓的登记本轮不会占用共同游玩位置，系统会按照其余在场登记的游玩偏好重新组成下一轮。',
+      confirm: '确认暂缓一次',
+      operation: 'DEFER_ONE_ROUND'
+    }
+  }
+  if (mode === 'temporary_leave') {
+    return {
+      title: registration.fixed_pair ? '确认整组暂时离开？' : '确认暂时离开？',
+      detail: registration.position === 'PLAYING'
+        ? `${subject}会离开游玩位置，并按一次轮空移至当前等待顺序末端。之后每次轮到时仍会移至队尾，状态不会自动解除。`
+        : `下一次轮到${subject}时不会进入游玩位置，而会按一次轮空移至当前等待顺序末端；之后每次轮到时仍会移至队尾。`,
+      note: '暂时离开的登记不会占用共同游玩位置。玩家返回后需要手动取消暂时离开；连续轮空 3 次后仍未取消，第四次轮到时会自动退出排队。',
+      confirm: '确认暂时离开',
+      operation: 'TEMPORARILY_LEAVE'
+    }
+  }
+  if (mode === 'cancel_defer') {
+    return {
+      title: registration.fixed_pair ? '确认整组取消暂缓一次？' : '确认取消暂缓一次？',
+      detail: `${subject}会恢复下一次游玩机会，并保持当前登记顺序。`,
+      confirm: '确认取消暂缓一次',
+      operation: 'CANCEL_DEFER_ONE_ROUND'
+    }
+  }
+  if (mode === 'cancel_temporary_leave') {
+    return {
+      title: registration.fixed_pair ? '确认整组取消暂时离开？' : '确认取消暂时离开？',
+      detail: `${subject}会恢复正常轮候，并将已轮空次数清零。`,
+      confirm: '确认取消暂时离开',
+      operation: 'CANCEL_TEMPORARY_LEAVE'
+    }
+  }
+  if (mode === 'leave') {
+    const details = [`${subject}会退出当前队列，继续游玩时需要重新加入排队。`]
+    if (registration.fixed_pair) {
+      details.push('固定组合会解除；另一份登记保留原位，并恢复为允许他人加入。')
+    }
+    if (registration.position === 'PLAYING') {
+      details.push('游玩位置中的空缺不会自动由等待顺序中的下一组登记补入。')
+    }
+    return {
+      title: '确认退出排队？',
+      detail: details.join(' '),
+      confirm: '确认退出排队',
+      operation: 'LEAVE_QUEUE',
+      danger: true
+    }
+  }
+  return null
+}
+
+function detailTransferPrompt(registration) {
+  const target = playerAccountQueueState.value?.queue?.machines?.find((machine) => (
+    machine.id === detailActionTargetMachineId.value
+  ))
+  if (!target) return null
+  const details = [
+    `这会将“${registration.display_id || registration.displayId}”从${registration.machine_name}移出，并加入${target.name}的登记顺序末端。`,
+    '原机台上的当前位置和排队顺序不会保留；之后即使转回，也只能加入转回时的队尾。'
+  ]
+  if (target.capacity === 1) {
+    details.push(`${target.name}仅能容纳一人游玩，转入后本次登记会使用“单人游玩”；玩家资料中的默认游玩偏好不会改变。`)
+  }
+  if (registration.fixed_pair) {
+    details.push('当前登记属于固定组合，只转移本人会解除固定组合；另一份登记保留原位并恢复为允许他人加入。')
+  }
+  if (registration.deferred_once) details.push('转入后这份登记不再暂缓一次。')
+  if (registration.temporarily_away) details.push('暂时离开状态和已轮空次数会保留，返回后仍需手动取消。')
+  return {
+    title: `转至 ${target.name}？`,
+    detail: details.join(' '),
+    confirm: `确认转至 ${target.name}`
+  }
+}
+
+function detailAccountCsrfHeaders() {
+  if (typeof document === 'undefined') return {}
+  const cookie = document.cookie.split(';').map((part) => part.trim()).find((part) => (
+    part.startsWith('maimai_q_session_csrf=')
+  ))
+  if (!cookie) return {}
+  try {
+    return { 'X-CSRF-Token': decodeURIComponent(cookie.slice('maimai_q_session_csrf='.length)) }
+  } catch {
+    return {}
+  }
+}
+
+function detailQueueOperationPayload(registration, operation, extra = {}) {
+  const state = playerAccountQueueState.value
+  return {
+    request_id: createRequestId(),
+    operation,
+    expected_queue_id: state.queue.queue_id,
+    expected_registration_id: registration.registration_id,
+    expected_machine_id: registration.machine_id,
+    expected_position: registration.position,
+    expected_fixed_pair_id: registration.fixed_pair_id || null,
+    expected_absence_status: detailRegistrationAbsenceStatus(registration),
+    expected_temporary_away_skipped_turns: registration.temporary_away_skipped_turns || 0,
+    expected_pending_check_in: registration.online_registration_pending_check_in === true,
+    expected_machine_configuration_revision: state.queue.machine_configuration_revision,
+    expected_machine_stable_id: registration.machine_stable_id,
+    ...extra
+  }
+}
+
+function finishDetailQueueAction(message, errorMessage = '') {
+  detailActionSubmitting.value = false
+  detailActionMode.value = null
+  detailActionNotice.value = message
+  detailActionError.value = errorMessage
+  refreshLoggedInPlayerQueue()
+  loadQueue(true)
+}
+
+async function pollDetailQueueAction(commandId, attempts = 0) {
+  try {
+    const response = await fetch(`${QUEUE_ONLINE_COMMAND_API_BASE}/${encodeURIComponent(commandId)}`, {
+      credentials: 'include',
+      cache: 'no-store',
+      headers: { Accept: 'application/json' }
+    })
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(payload.error || '暂时无法读取现场处理结果。')
+    if (payload.status === 'PENDING' && attempts < 30) {
+      detailActionTimer = window.setTimeout(() => pollDetailQueueAction(commandId, attempts + 1), 1500)
+      return
+    }
+    if (payload.status === 'APPLIED') {
+      finishDetailQueueAction(payload.result_detail || '现场终端已完成这次操作。')
+    } else if (payload.status === 'PENDING') {
+      finishDetailQueueAction('操作仍在等待现场终端处理，请稍后刷新查看。')
+    } else {
+      finishDetailQueueAction('', payload.result_detail || '现场终端没有执行这次操作。')
+    }
+  } catch (error) {
+    if (attempts < 30) {
+      detailActionTimer = window.setTimeout(() => pollDetailQueueAction(commandId, attempts + 1), 1500)
+    } else {
+      finishDetailQueueAction('', error.message)
+    }
+  }
+}
+
+async function submitDetailQueueAction(accountRegistration, operation, extra = {}) {
+  const state = playerAccountQueueState.value
+  if (!accountRegistration || !state?.queue || detailActionSubmitting.value) return
+  if (!state.queue.remote_actions) {
+    detailActionError.value = '现场未开启网站远程操作，当前只能查看状态。'
+    return
+  }
+  detailActionSubmitting.value = true
+  detailActionError.value = ''
+  detailActionNotice.value = '操作已提交，正在等待现场终端确认。'
+  try {
+    const response = await fetch(`${PLAYER_ACCOUNT_API_URL}/queue-commands`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json', ...detailAccountCsrfHeaders() },
+      body: JSON.stringify(detailQueueOperationPayload(accountRegistration, operation, extra))
+    })
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(payload.error || '暂时无法提交这次操作。')
+    if (payload.status === 'APPLIED' || payload.status === 'REJECTED') {
+      await pollDetailQueueAction(payload.command_id)
+    } else {
+      pollDetailQueueAction(payload.command_id)
+    }
+  } catch (error) {
+    finishDetailQueueAction('', error.message)
+  }
+}
+
+function openDetailAction(mode) {
+  detailActionMode.value = mode
+  detailActionError.value = ''
+  detailActionNotice.value = ''
+}
+
 function openRegistration(
   machine,
   registration,
@@ -1407,8 +1766,10 @@ function openRegistration(
   estimatedWaitMinutes = null,
   locationRegistrations = [],
   commonPlayPreview = null,
-  isPlaying = false
+  isPlaying = false,
+  preserveAction = false
 ) {
+  if (!preserveAction) resetDetailAction()
   selectedDetail.value = {
     kind: 'registration',
     title: registration.displayId,
@@ -1437,15 +1798,20 @@ function openRegistrationFromPosition(registration) {
 }
 
 function closeDetail() {
+  resetDetailAction()
   selectedDetail.value = null
 }
 
 function markedSelfStatusTitle() {
   const location = markedSelfLocation.value
+  const identity = activeSelfIdentity.value
   if (!terminalOnline.value) return '队列状态等待更新'
   if (!location) {
-    if (markedSelfAmbiguous.value) return '发现多份同名登记'
-    if (markedSelf.value?.queueId !== queueId.value) return '当前队列中还没有你的登记'
+    if (markedSelfAmbiguous.value) {
+      return accountSessionActive.value ? '当前账户有多份登记' : '发现多份同名登记'
+    }
+    if (accountSessionActive.value) return '当前队列中没有你的登记'
+    if (identity?.queueId !== queueId.value) return '当前队列中还没有你的登记'
     if (markedSelfLastEvent.value) return eventOutcomeTitle(markedSelfLastEvent.value)
     return '你的登记目前不在队列中'
   }
@@ -1463,12 +1829,15 @@ function markedSelfStatusDetail() {
   if (!terminalOnline.value) {
     return location
       ? `最后一次同步时，你位于${location.label}。终端恢复同步后，请再确认当前安排。`
-      : `${snapshotStale.value ? '队列长时间没有更新' : '现场终端暂时离线'}，暂时无法确认你的当前状态。标记会继续保留。`
+      : `${snapshotStale.value ? '队列长时间没有更新' : '现场终端暂时离线'}，暂时无法确认${accountSessionActive.value ? '登录玩家' : '你的'}当前状态。${accountSessionActive.value ? '恢复同步后会按登录玩家资料重新匹配。' : '标记会继续保留。'}`
   }
   if (!location) {
     if (markedSelfAmbiguous.value) {
-      return `当前有多份昵称为“${markedSelf.value?.displayId}”的登记。请点开属于你的登记，并再次选择“标记为自己”。`
+      return accountSessionActive.value
+        ? '当前账户关联到多份登记，网页不会自动选择其中一份。请打开玩家资料查看，或在现场终端处理。'
+        : `当前有多份昵称为“${markedSelf.value?.displayId}”的登记。请点开属于你的登记，并再次选择“标记为自己”。`
     }
+    if (accountSessionActive.value) return '当前账户在这个队列中没有登记。'
     if (markedSelf.value?.queueId !== queueId.value) {
       return '标记会继续保留；使用相同昵称加入当前队列后，位置和预计时间会自动恢复更新。'
     }
@@ -1550,9 +1919,9 @@ function eventTypeLabel(type) {
     REGISTRATION_UPDATED: '登记变动',
     QUEUE_REORDERED: '顺序调整',
     PLAYING_CHANGED: '游玩位置',
-     NO_SHOW_DEFERRED: '未到场·暂缓一次',
-     NO_SHOW_MOVED_TO_TAIL: '未到场·移至队尾',
-     NO_SHOW_REMOVED: '未到场·移除登记',
+     NO_SHOW_DEFERRED: '未到场 · 暂缓一次',
+     NO_SHOW_MOVED_TO_TAIL: '未到场 · 移至队尾',
+     NO_SHOW_REMOVED: '未到场 · 移除登记',
     TEMPORARY_AWAY_EXPIRED: '暂时离开期满退出',
     ONLINE_REGISTRATION_ADDED: '线上登记',
     ONLINE_CHECK_IN_COMPLETED: '现场签到',
@@ -1614,7 +1983,7 @@ function createRequestId() {
 
 function normalizeOnlineMachine(source) {
   const id = String(source?.id || '').toUpperCase()
-  const name = compactMiddleDots(String(source?.name || `机台 ${id}`))
+  const name = formatMiddleDots(String(source?.name || `机台 ${id}`))
   const configuration = normalizeMachineConfiguration(source, { id, name })
   const registrationCount = toNonNegativeInteger(
     source?.registration_count ?? source?.registrationCount
@@ -1701,10 +2070,11 @@ function firstAvailableOnlineMachineId() {
     onlineJoinMachineOptions.value[0]?.id || machines.value[0]?.id || 'A'
 }
 
-function resetOnlineJoin() {
+function resetOnlineJoin(audience = 'OTHER') {
   if (onlineCommandTimer) window.clearTimeout(onlineCommandTimer)
   onlineCommandTimer = null
   onlineJoinStep.value = 'LOOKUP'
+  onlineJoinAudience.value = audience
   onlineJoinQq.value = ''
   onlineJoinMachineId.value = firstAvailableOnlineMachineId()
   onlineJoinProfile.value = null
@@ -1746,14 +2116,26 @@ function hasRestartedOnlineCheckInWindow(registration) {
     startedAt !== createdAt
 }
 
-function openOnlineJoin() {
+async function openOnlineJoin() {
   if (!onlineRegistrationAvailable.value) return
+  if (!playerAccountSessionReady.value) await refreshLoggedInPlayerSession()
   if (!['PENDING', 'REJECTED'].includes(onlineJoinStep.value)) resetOnlineJoin()
   onlineJoinVisible.value = true
+  if (playerAccount.value?.profile?.qq_number) {
+    onlineJoinAudience.value = 'SELF'
+    onlineJoinQq.value = playerAccount.value.profile.qq_number
+    onlineJoinStep.value = 'SELF_LOADING'
+    queryOnlineProfile()
+  }
 }
 
 function closeOnlineJoin() {
   onlineJoinVisible.value = false
+}
+
+function beginOtherOnlineJoin() {
+  resetOnlineJoin('OTHER')
+  onlineJoinVisible.value = true
 }
 
 function handleOnlineJoinQqInput(event) {
@@ -1834,10 +2216,25 @@ async function queryOnlineProfile() {
         : profile.defaultPreference
     onlineJoinStep.value = onlineJoinExistingRegistration.value ? 'EXISTING' : 'CONFIRM'
   } catch (error) {
+    if (onlineJoinAudience.value === 'SELF' && onlineJoinStep.value === 'SELF_LOADING') {
+      onlineJoinStep.value = 'SELF_ERROR'
+    }
     onlineJoinError.value = error?.message || '暂时无法查询玩家资料，请稍后重试。'
   } finally {
     onlineJoinLoading.value = false
   }
+}
+
+function retryOwnOnlineJoin() {
+  if (!playerAccount.value?.profile?.qq_number) {
+    beginOtherOnlineJoin()
+    return
+  }
+  onlineJoinAudience.value = 'SELF'
+  onlineJoinQq.value = playerAccount.value.profile.qq_number
+  onlineJoinError.value = ''
+  onlineJoinStep.value = 'SELF_LOADING'
+  queryOnlineProfile()
 }
 
 function backToOnlineLookup() {
@@ -1894,6 +2291,7 @@ function existingOnlineRegistrationText() {
 }
 
 function markOnlinePlayerAsSelf(registration = null, allowReplacementPrompt = true) {
+  if (playerAccount.value) return true
   const profile = onlineJoinProfile.value
   const targetQueueId = onlineJoinQueueId.value || queueId.value
   if (!profile || !targetQueueId) return false
@@ -1922,6 +2320,54 @@ function markOnlinePlayerAsSelf(registration = null, allowReplacementPrompt = tr
   })
   showMachineGroup(machines.value.find((machine) => machine.id === machineId))
   return true
+}
+
+function openExistingOnlineRegistration(registration = null) {
+  const registrationId = registration?.registration_id ?? registration?.registrationId ?? ''
+  const location = registrationId
+    ? registrationLocations.value.find(({ registration: candidate }) => (
+      candidate.registrationId === registrationId
+    ))
+    : null
+
+  // Anonymous self lookups retain the existing local marker behavior. A lookup
+  // made for someone else must never turn that person's registration into ours.
+  if (onlineJoinAudience.value === 'SELF' && !playerAccount.value &&
+    !markOnlinePlayerAsSelf(registration)) {
+    closeOnlineJoin()
+    return
+  }
+
+  closeOnlineJoin()
+  if (!location) {
+    loadQueue(true)
+    return
+  }
+  showMachineGroup(location.machine)
+  openRegistration(
+    location.machine,
+    location.registration,
+    location.label,
+    location.kind === 'PLAYING' ? null : location.estimate,
+    location.registrations,
+    location.commonPlayPreview,
+    location.kind === 'PLAYING'
+  )
+}
+
+function openActiveSelfDetail() {
+  const location = markedSelfLocation.value
+  if (!location) return
+  showMachineGroup(location.machine)
+  openRegistration(
+    location.machine,
+    location.registration,
+    location.label,
+    location.kind === 'PLAYING' ? null : location.estimate,
+    location.registrations,
+    location.commonPlayPreview,
+    location.kind === 'PLAYING'
+  )
 }
 
 function scheduleOnlineCommandPoll() {
@@ -2108,6 +2554,7 @@ onMounted(async () => {
   }
   restoreMarkedSelf()
   await loadQueue()
+  await refreshLoggedInPlayerSession()
   refreshTimer = window.setInterval(() => loadQueue(true), REFRESH_INTERVAL)
   clockTimer = window.setInterval(() => { currentTime.value = Date.now() }, 30000)
   window.addEventListener('keydown', handleKeydown)
@@ -2118,6 +2565,7 @@ onBeforeUnmount(() => {
   if (refreshTimer) window.clearInterval(refreshTimer)
   if (clockTimer) window.clearInterval(clockTimer)
   if (onlineCommandTimer) window.clearTimeout(onlineCommandTimer)
+  if (detailActionTimer) window.clearTimeout(detailActionTimer)
   window.removeEventListener('keydown', handleKeydown)
 })
 </script>
@@ -2165,8 +2613,8 @@ onBeforeUnmount(() => {
             <button
               class="queue-version-button"
               type="button"
-              aria-label="打开个人账户"
-              title="个人账户"
+              aria-label="打开玩家资料"
+              title="玩家资料"
               @click="openPlayerAccount"
             >
               <UserRound :size="18" aria-hidden="true" />
@@ -2208,13 +2656,16 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <section v-if="markedSelf" class="queue-self" :class="`is-${markedSelfTone()}`" aria-live="polite">
+    <section v-if="activeSelfIdentity" class="queue-self" :class="[`is-${markedSelfTone()}`, { 'is-clickable': markedSelfLocation }]"
+      :role="markedSelfLocation ? 'button' : undefined" :tabindex="markedSelfLocation ? 0 : undefined"
+      aria-live="polite" @click="openActiveSelfDetail"
+      @keydown.enter.self.prevent="openActiveSelfDetail" @keydown.space.self.prevent="openActiveSelfDetail">
       <div class="queue-self-icon" aria-hidden="true">
         <UserRoundCheck :size="22" />
       </div>
       <div class="queue-self-main">
         <span class="queue-self-eyebrow">我的排队</span>
-        <h2>{{ markedSelf.displayId }}</h2>
+        <h2>{{ activeSelfIdentity.displayId }}</h2>
         <strong>{{ markedSelfStatusTitle() }}</strong>
         <p>{{ markedSelfStatusDetail() }}</p>
         <div v-if="markedSelfLocation" class="queue-self-facts">
@@ -2226,12 +2677,13 @@ onBeforeUnmount(() => {
           <span v-if="markedSelfLocation.registrations.length > 1">
             <Users :size="13" aria-hidden="true" />共同游玩
           </span>
-          <span v-if="!selfStorageAvailable" class="is-warning">
+          <span v-if="!accountSessionActive && !selfStorageAvailable" class="is-warning">
             仅在本次浏览期间保留
           </span>
         </div>
       </div>
-      <button class="queue-self-clear" type="button" @click="clearMarkedSelf">取消标记</button>
+      <button v-if="!accountSessionActive" class="queue-self-clear" type="button" @click.stop="clearMarkedSelf">取消标记</button>
+      <span v-else class="queue-self-account-badge">已登录</span>
     </section>
 
     <section v-if="hasSnapshot && activeView === 'queue'" class="queue-online-entry"
@@ -2472,8 +2924,11 @@ onBeforeUnmount(() => {
       <PlayerAccountDialog
         v-if="playerAccountDialogVisible"
         :binding-token="playerAccountBindingToken"
+        :focus-registration-id="playerAccountFocusRegistrationId"
         @close="closePlayerAccount"
         @bound="handlePlayerAccountBound"
+        @session="handlePlayerAccountSession"
+        @queue-state="handlePlayerAccountQueueState"
       />
       <Transition name="queue-dialog">
         <div v-if="versionDialogVisible" class="queue-detail-backdrop" @click.self="closeVersionDialog">
@@ -2540,12 +2995,16 @@ onBeforeUnmount(() => {
             <header class="queue-detail-header">
               <div>
                 <h2>{{ onlineJoinStep === 'LOOKUP' ? '加入排队'
+                  : onlineJoinStep === 'SELF_LOADING' ? '正在读取本人资料'
+                    : onlineJoinStep === 'SELF_ERROR' ? '无法读取本人资料'
                   : onlineJoinStep === 'CONFIRM' ? '确认登记信息'
                     : onlineJoinStep === 'EXISTING' ? '你已在排队'
                       : onlineJoinStep === 'PENDING' ? '正在提交登记'
                         : onlineJoinStep === 'REJECTED' ? '登记没有执行'
                           : '线上登记已完成' }}</h2>
                 <p v-if="onlineJoinStep === 'LOOKUP'">使用已在现场终端建立的玩家资料</p>
+                <p v-else-if="onlineJoinStep === 'SELF_LOADING'">正在使用当前登录的玩家资料</p>
+                <p v-else-if="onlineJoinStep === 'SELF_ERROR'">当前登录资料暂时无法用于线上登记</p>
                 <p v-else-if="onlineJoinStep === 'CONFIRM'">核对资料，并确认本次排队安排</p>
                 <p v-else-if="onlineJoinStep === 'PENDING'">正在等待现场终端处理</p>
               </div>
@@ -2554,7 +3013,36 @@ onBeforeUnmount(() => {
               </button>
             </header>
 
-            <form v-if="onlineJoinStep === 'LOOKUP'" class="queue-online-form" @submit.prevent="queryOnlineProfile">
+            <section v-if="onlineJoinStep === 'SELF_LOADING'" class="queue-online-result" aria-live="polite">
+              <span class="queue-online-result-icon">
+                <RefreshCw :size="23" class="spinning" />
+              </span>
+              <strong>正在确认你的玩家资料</strong>
+              <p>将使用当前登录的玩家资料，不会显示完整玩家资料库。</p>
+            </section>
+
+            <section v-else-if="onlineJoinStep === 'SELF_ERROR'" class="queue-online-result is-rejected" aria-live="assertive">
+              <span class="queue-online-result-icon is-rejected">
+                <TriangleAlert :size="23" />
+              </span>
+              <strong>暂时无法确认本人资料</strong>
+              <p>{{ onlineJoinError }}</p>
+              <button class="queue-online-primary" type="button" :disabled="onlineJoinLoading" @click="retryOwnOnlineJoin">
+                重新读取本人资料
+              </button>
+              <button class="queue-online-secondary" type="button" @click="beginOtherOnlineJoin">
+                为他人创建线上登记
+              </button>
+            </section>
+
+            <form v-else-if="onlineJoinStep === 'LOOKUP'" class="queue-online-form" @submit.prevent="queryOnlineProfile">
+              <div class="queue-online-other-notice">
+                <TriangleAlert :size="18" aria-hidden="true" />
+                <p>
+                  <strong>为他人创建线上登记</strong>
+                  <span>请先取得本人同意。登记创建后，必须由本人到现场终端点击“已到场”完成签到；创建者不能代替签到，也不能代替他人操作登记。</span>
+                </p>
+              </div>
               <label class="queue-online-field">
                 <span>QQ 号</span>
                 <input :value="onlineJoinQq" inputmode="numeric" autocomplete="off" maxlength="12"
@@ -2657,8 +3145,15 @@ onBeforeUnmount(() => {
                 <TriangleAlert :size="18" aria-hidden="true" />
                 <p>
                   <strong>须在 30 分钟内完成签到</strong>
-                  <span>登记加入后会显示为“线上登记·待签到”。请到现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。</span>
+                  <span>登记加入后会显示为“线上登记 · 待签到”。请到现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。</span>
                   <span v-if="!onlineJoinProfile.setupComplete">这份玩家资料尚未补全通知偏好和 QQ 显示范围。线上登记可以先创建，但到场后须先在终端补全资料，才能签到。</span>
+                </p>
+              </div>
+              <div v-if="onlineJoinAudience === 'OTHER'" class="queue-online-other-notice">
+                <TriangleAlert :size="18" aria-hidden="true" />
+                <p>
+                  <strong>请确认你是在代本人创建</strong>
+                  <span>线上登记只代表排队意向，不代表本人已到场。请把机台和签到规则告知对方，并由对方本人到现场完成签到。</span>
                 </p>
               </div>
               <p v-if="onlineJoinError" class="queue-online-error" role="alert">{{ onlineJoinError }}</p>
@@ -2669,6 +3164,10 @@ onBeforeUnmount(() => {
                   {{ onlineJoinLoading ? '正在提交' : '完成并加入排队' }}
                 </button>
               </div>
+              <button v-if="onlineJoinAudience === 'SELF'" class="queue-online-secondary queue-online-other-button"
+                type="button" @click="beginOtherOnlineJoin">
+                为他人创建线上登记
+              </button>
             </div>
 
             <div v-else-if="onlineJoinStep === 'EXISTING'" class="queue-online-result">
@@ -2681,8 +3180,8 @@ onBeforeUnmount(() => {
                 : '不能重复加入排队。' }}</p>
               <p v-if="onlineJoinExistingRegistration.online_registration_pending_check_in && !onlineJoinProfile.setupComplete">这份玩家资料尚未补全。到场后须先在终端补全资料，才能签到。</p>
               <button class="queue-online-primary" type="button"
-                @click="markOnlinePlayerAsSelf(onlineJoinExistingRegistration); closeOnlineJoin()">
-                查看我的排队
+                @click="openExistingOnlineRegistration(onlineJoinExistingRegistration)">
+                {{ onlineJoinAudience === 'OTHER' ? '查看该登记' : '查看我的排队' }}
               </button>
             </div>
 
@@ -2795,7 +3294,7 @@ onBeforeUnmount(() => {
               <div class="queue-detail-pills">
                 <span>{{ selectedDetail.registrations.length }} 个登记</span>
                 <span v-if="!selectedDetail.machine.operational">
-                  机台已停止使用·{{ stopReasonLabel(
+                  机台已停止使用 · {{ stopReasonLabel(
                     selectedDetail.machine.stopReason,
                     selectedDetail.machine.stopReasonDetail
                   ) }}
@@ -2830,7 +3329,7 @@ onBeforeUnmount(() => {
             <template v-else>
               <div class="queue-detail-pills">
                 <span v-if="selectedDetail.registration.onlineRegistrationPendingCheckIn" class="is-online">
-                  线上登记·待签到
+                  线上登记 · 待签到
                 </span>
                 <span :class="{ 'is-absence': absenceLabel(selectedDetail.registration) }">
                   {{ absenceLabel(selectedDetail.registration) || preferenceLabel(selectedDetail.registration) }}
@@ -2877,7 +3376,7 @@ onBeforeUnmount(() => {
                 </div>
                 <div v-if="!selectedDetail.machine.operational">
                   <dt>机台状态</dt>
-                  <dd>停止使用·{{ stopReasonLabel(
+                  <dd>停止使用 · {{ stopReasonLabel(
                     selectedDetail.machine.stopReason,
                     selectedDetail.machine.stopReasonDetail
                   ) }}</dd>
@@ -2891,17 +3390,111 @@ onBeforeUnmount(() => {
                   <dd>{{ fullTimeText(selectedDetail.registration.lastPlayedAt, '尚未游玩') }}</dd>
                 </div>
               </dl>
-              <button v-if="selectedDetail.registration.registrationId && !isMarkedRegistration(selectedDetail.registration)"
+              <template v-if="accountSessionActive && isAccountRegistration(selectedDetail.registration)">
+                <section v-if="accountQueueRegistrationFor(selectedDetail.registration)" class="queue-detail-account-actions">
+                  <div class="queue-detail-action-heading">
+                    <div>
+                      <strong>登记操作</strong>
+                      <span>与现场终端保持一致，提交后由终端按最新状态确认</span>
+                    </div>
+                  </div>
+                  <p v-if="!playerAccountQueueState.queue?.terminal_online" class="queue-detail-action-warning">
+                    现场终端暂时离线，当前只能查看状态。
+                  </p>
+                  <p v-else-if="!playerAccountQueueState.queue?.remote_actions" class="queue-detail-action-warning">
+                    现场未开启网站远程操作，当前只能查看状态。
+                  </p>
+                  <template v-if="detailActionMode === 'transfer'">
+                    <strong class="queue-detail-action-title">选择要转至的机台</strong>
+                    <div class="queue-detail-action-choices">
+                      <button v-for="machine in playerAccountQueueState.queue.machines.filter((item) => item.id !== accountQueueRegistrationFor(selectedDetail.registration).machine_id)"
+                        :key="machine.id" type="button" :disabled="machine.available !== true || detailActionSubmitting"
+                        :class="{ active: detailActionTargetMachineId === machine.id }"
+                        @click="detailActionTargetMachineId = machine.id">
+                        {{ machine.name }}
+                      </button>
+                    </div>
+                    <p v-if="detailTransferPrompt(accountQueueRegistrationFor(selectedDetail.registration))" class="queue-detail-action-detail">
+                      {{ detailTransferPrompt(accountQueueRegistrationFor(selectedDetail.registration)).detail }}
+                    </p>
+                    <div class="queue-detail-action-confirm">
+                      <button type="button" :disabled="detailActionSubmitting" @click="detailActionMode = null">取消</button>
+                      <button class="primary" type="button"
+                        :disabled="!detailActionTargetMachineId || detailActionSubmitting"
+                        @click="submitDetailQueueAction(accountQueueRegistrationFor(selectedDetail.registration), 'TRANSFER_MACHINE', { target_machine_id: detailActionTargetMachineId, expected_target_machine_stable_id: playerAccountQueueState.queue.machines.find((machine) => machine.id === detailActionTargetMachineId)?.stable_id })">
+                        {{ detailTransferPrompt(accountQueueRegistrationFor(selectedDetail.registration))?.confirm || '确认转至其他机台' }}
+                      </button>
+                    </div>
+                  </template>
+                  <template v-else-if="detailActionMode === 'preference'">
+                    <strong class="queue-detail-action-title">选择本次游玩偏好</strong>
+                    <p class="queue-detail-action-detail">这里只修改本次排队的偏好，不会改变玩家资料中的默认偏好。</p>
+                    <div class="queue-detail-action-choices is-two">
+                      <button type="button" :class="{ active: detailActionPreference === 'SOLO' }"
+                        :disabled="detailActionSubmitting" @click="detailActionPreference = 'SOLO'">单人游玩</button>
+                      <button type="button" :class="{ active: detailActionPreference === 'OPEN_TO_JOIN' }"
+                        :disabled="detailActionSubmitting" @click="detailActionPreference = 'OPEN_TO_JOIN'">允许他人加入</button>
+                    </div>
+                    <div class="queue-detail-action-confirm">
+                      <button type="button" :disabled="detailActionSubmitting" @click="detailActionMode = null">取消</button>
+                      <button class="primary" type="button" :disabled="detailActionSubmitting"
+                        @click="submitDetailQueueAction(accountQueueRegistrationFor(selectedDetail.registration), 'CHANGE_PLAY_PREFERENCE', { preference: detailActionPreference })">
+                        确认修改游玩偏好
+                      </button>
+                    </div>
+                  </template>
+                  <template v-else-if="['defer', 'temporary_leave', 'cancel_defer', 'cancel_temporary_leave', 'leave'].includes(detailActionMode)">
+                    <template v-if="detailActionPrompt(accountQueueRegistrationFor(selectedDetail.registration), detailActionMode)">
+                      <strong class="queue-detail-action-title">{{ detailActionPrompt(accountQueueRegistrationFor(selectedDetail.registration), detailActionMode).title }}</strong>
+                      <p class="queue-detail-action-detail">{{ detailActionPrompt(accountQueueRegistrationFor(selectedDetail.registration), detailActionMode).detail }}</p>
+                      <p v-if="detailActionPrompt(accountQueueRegistrationFor(selectedDetail.registration), detailActionMode).note" class="queue-detail-action-note">
+                        {{ detailActionPrompt(accountQueueRegistrationFor(selectedDetail.registration), detailActionMode).note }}
+                      </p>
+                    </template>
+                    <div class="queue-detail-action-confirm">
+                      <button type="button" :disabled="detailActionSubmitting" @click="detailActionMode = null">取消</button>
+                      <button class="primary" :class="{ 'is-danger': detailActionMode === 'leave' }" type="button"
+                        :disabled="detailActionSubmitting || !detailActionPrompt(accountQueueRegistrationFor(selectedDetail.registration), detailActionMode)"
+                        @click="submitDetailQueueAction(accountQueueRegistrationFor(selectedDetail.registration), detailActionPrompt(accountQueueRegistrationFor(selectedDetail.registration), detailActionMode).operation)">
+                        {{ detailActionPrompt(accountQueueRegistrationFor(selectedDetail.registration), detailActionMode)?.confirm }}
+                      </button>
+                    </div>
+                  </template>
+                  <div v-else class="queue-detail-action-buttons">
+                    <template v-if="!accountQueueRegistrationFor(selectedDetail.registration).online_registration_pending_check_in">
+                      <button v-if="accountQueueRegistrationFor(selectedDetail.registration).deferred_once" type="button"
+                        :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="openDetailAction('cancel_defer')">取消暂缓一次</button>
+                      <button v-else-if="playerAccountQueueState.queue?.queue_rules?.allow_defer_one_round" type="button"
+                        :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="openDetailAction('defer')">暂缓一次</button>
+                      <button v-if="accountQueueRegistrationFor(selectedDetail.registration).temporarily_away" type="button"
+                        :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="openDetailAction('cancel_temporary_leave')">取消暂时离开</button>
+                      <button v-else-if="playerAccountQueueState.queue?.queue_rules?.allow_temporary_leave" type="button"
+                        :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="openDetailAction('temporary_leave')">暂时离开</button>
+                      <button v-if="accountQueueRegistrationFor(selectedDetail.registration).position !== 'PLAYING' && playerAccountQueueState.queue.machines.some((machine) => machine.id !== accountQueueRegistrationFor(selectedDetail.registration).machine_id && machine.available)" type="button"
+                        :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="detailActionTargetMachineId = ''; openDetailAction('transfer')">转至其他机台</button>
+                      <button v-if="accountQueueRegistrationFor(selectedDetail.registration).machine_capacity > 1" type="button"
+                        :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="detailActionPreference = accountQueueRegistrationFor(selectedDetail.registration).preference; openDetailAction('preference')">修改游玩偏好</button>
+                    </template>
+                    <button class="is-danger" type="button" :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="openDetailAction('leave')">退出排队</button>
+                  </div>
+                  <p v-if="detailActionError" class="queue-detail-action-error" role="alert">{{ detailActionError }}</p>
+                  <p v-if="detailActionNotice" class="queue-detail-action-notice" role="status">{{ detailActionNotice }}</p>
+                </section>
+              </template>
+              <button v-if="selectedDetail.registration.registrationId && !accountSessionActive && !isMarkedRegistration(selectedDetail.registration)"
                 class="queue-detail-primary" type="button" @click="requestMarkAsSelf(selectedDetail.registration)">
                 <UserRoundCheck :size="18" aria-hidden="true" />
                 标记为自己
               </button>
-              <button v-else-if="isMarkedRegistration(selectedDetail.registration)"
+              <button v-else-if="!accountSessionActive && isMarkedRegistration(selectedDetail.registration)"
                 class="queue-detail-secondary" type="button" @click="clearMarkedSelf(); closeDetail()">
                 取消标记为自己
               </button>
-              <p class="queue-detail-privacy">
+              <p v-if="!accountSessionActive" class="queue-detail-privacy">
                 标记使用的昵称、QQ 号和公开登记标识仅保存在此浏览器中。
+              </p>
+              <p v-else class="queue-detail-privacy">
+                已登录玩家资料，打开自己的登记即可查看与终端一致的操作菜单。
               </p>
             </template>
           </section>
@@ -2987,10 +3580,11 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
   font-weight: 600;
   letter-spacing: 0;
 }
+
 .queue-heading h1 { margin: 0; border: 0; font-size: 34px; font-weight: 660; line-height: 1.15; letter-spacing: 0; }
-.queue-heading p { display: flex; margin: 7px 0 0; flex-wrap: wrap; gap: 0 6px; color: var(--queue-secondary); font-size: 13px; line-height: 1.55; }
+.queue-heading p { display: flex; margin: 7px 0 0; flex-wrap: wrap; gap: 0; color: var(--queue-secondary); font-size: 13px; line-height: 1.55; }
 .queue-heading strong { color: var(--queue-text); font-weight: 560; }
-.queue-heading-separator { color: var(--queue-tertiary); }
+.queue-heading-separator { display: inline-flex; width: 1em; flex: 0 0 1em; justify-content: center; color: var(--queue-tertiary); }
 .queue-toolbar { display: flex; min-width: 0; flex-direction: column; gap: 12px; }
 .queue-view-tabs { display: grid; width: 100%; padding: 3px; grid-template-columns: 1fr 1fr; border-radius: 10px; background: color-mix(in srgb, var(--queue-separator) 42%, transparent); }
 .queue-view-tabs button { display: flex; min-height: 36px; align-items: center; justify-content: center; gap: 6px; border: 0; border-radius: 8px; color: var(--queue-secondary); background: transparent; cursor: pointer; font-size: 12px; transition: color .16s ease, background .16s ease, box-shadow .16s ease; }
@@ -3019,6 +3613,8 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-stale-notice span { margin-top: 2px; color: var(--queue-secondary); font-size: 11px; line-height: 1.55; }
 
 .queue-self { display: grid; margin: 0 0 18px; padding: 17px 18px; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: start; gap: 13px; border: 1px solid color-mix(in srgb, var(--queue-blue) 28%, var(--queue-separator)); border-radius: 14px; background: color-mix(in srgb, var(--queue-soft-blue) 72%, var(--queue-card)); }
+.queue-self.is-clickable { cursor: pointer; }
+.queue-self.is-clickable:focus-visible { outline: 2px solid var(--queue-blue); outline-offset: 2px; }
 .queue-self.is-warning { border-color: color-mix(in srgb, #ff9500 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-orange) 74%, var(--queue-card)); }
 .queue-self.is-danger { border-color: color-mix(in srgb, var(--queue-red) 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-red) 76%, var(--queue-card)); }
 .queue-self.is-online { border-color: color-mix(in srgb, var(--queue-online) 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-online) 78%, var(--queue-card)); }
@@ -3035,6 +3631,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-self-facts { display: flex; margin-top: 9px; flex-wrap: wrap; gap: 6px; }
 .queue-self-facts span { display: flex; padding: 4px 7px; align-items: center; gap: 4px; border-radius: 6px; color: var(--queue-secondary); background: color-mix(in srgb, var(--queue-card) 82%, transparent); font-size: 10px; }
 .queue-self-clear { padding: 7px 8px; border: 0; color: var(--queue-secondary); background: transparent; cursor: pointer; font-size: 11px; }
+.queue-self-account-badge { padding: 5px 7px; border-radius: 6px; color: var(--queue-blue); background: var(--queue-soft-blue); font-size: 10px; font-weight: 600; white-space: nowrap; }
 
 .queue-online-entry { display: grid; min-height: 66px; margin: 0 0 16px; padding: 11px 12px; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 11px; border: 1px solid color-mix(in srgb, var(--queue-online) 24%, var(--queue-separator)); border-radius: 11px; background: color-mix(in srgb, var(--queue-soft-online) 48%, var(--queue-card)); }
 .queue-online-entry.is-disabled { border-color: var(--queue-separator); background: var(--queue-card); }
@@ -3187,6 +3784,30 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-detail-metadata dt, .queue-detail-metadata dd { margin: 0; font-size: 11px; line-height: 1.5; }
 .queue-detail-metadata dt { color: var(--queue-tertiary); }
 .queue-detail-metadata dd { overflow-wrap: anywhere; text-align: right; }
+.queue-detail-account-actions { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--queue-separator); }
+.queue-detail-action-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.queue-detail-action-heading strong, .queue-detail-action-heading span { display: block; }
+.queue-detail-action-heading strong { font-size: 13px; font-weight: 620; }
+.queue-detail-action-heading span { margin-top: 3px; color: var(--queue-secondary); font-size: 10px; line-height: 1.45; }
+.queue-detail-action-warning { margin: 12px 0 0; padding: 9px 10px; border-left: 3px solid var(--queue-orange); color: var(--queue-secondary); background: var(--queue-soft-orange); font-size: 10px; line-height: 1.5; }
+.queue-detail-action-buttons { display: grid; margin-top: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.queue-detail-action-buttons button, .queue-detail-action-confirm button { min-height: 40px; padding: 7px 9px; border: 1px solid var(--queue-separator); border-radius: 8px; color: var(--queue-text); background: var(--queue-position); cursor: pointer; font-size: 11px; line-height: 1.35; }
+.queue-detail-action-buttons button.is-danger, .queue-detail-action-confirm button.is-danger { color: var(--queue-red); }
+.queue-detail-action-buttons button:disabled, .queue-detail-action-confirm button:disabled { color: var(--queue-tertiary); background: var(--queue-disabled); cursor: default; }
+.queue-detail-action-title { display: block; margin-top: 13px; font-size: 12px; font-weight: 620; }
+.queue-detail-action-detail, .queue-detail-action-note { margin: 7px 0 0; color: var(--queue-secondary); font-size: 10px; line-height: 1.6; }
+.queue-detail-action-note { color: var(--queue-orange); }
+.queue-detail-action-choices { display: grid; margin-top: 9px; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 7px; }
+.queue-detail-action-choices.is-two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.queue-detail-action-choices button { min-height: 40px; padding: 7px 9px; border: 1px solid var(--queue-separator); border-radius: 8px; color: var(--queue-text); background: var(--queue-position); cursor: pointer; font-size: 11px; }
+.queue-detail-action-choices button.active { border-color: var(--queue-blue); color: var(--queue-blue); background: var(--queue-soft-blue); }
+.queue-detail-action-choices button:disabled { color: var(--queue-tertiary); background: var(--queue-disabled); cursor: default; }
+.queue-detail-action-confirm { display: grid; margin-top: 10px; grid-template-columns: 1fr 1.35fr; gap: 7px; }
+.queue-detail-action-confirm button.primary { border-color: var(--queue-blue); color: #fff; background: var(--queue-blue); }
+.queue-detail-action-confirm button.primary.is-danger { border-color: var(--queue-red); background: var(--queue-red); }
+.queue-detail-action-error, .queue-detail-action-notice { margin: 9px 0 0; padding: 8px 9px; border-radius: 7px; font-size: 10px; line-height: 1.5; }
+.queue-detail-action-error { color: var(--queue-red); background: var(--queue-soft-red); }
+.queue-detail-action-notice { color: var(--queue-online); background: var(--queue-soft-online); }
 .queue-detail-primary, .queue-detail-secondary { display: flex; width: 100%; min-height: 44px; margin-top: 17px; padding: 0 14px; align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: 9px; cursor: pointer; font-size: 12px; font-weight: 600; transition: filter .16s ease, transform .12s ease; }
 .queue-detail-primary:active, .queue-detail-secondary:active { transform: scale(.99); }
 .queue-detail-primary { color: #fff; background: var(--queue-blue); }
@@ -3257,6 +3878,12 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-online-check-in-notice strong, .queue-online-check-in-notice span { display: block; }
 .queue-online-check-in-notice strong { font-size: 11px; font-weight: 640; line-height: 1.45; }
 .queue-online-check-in-notice span { margin-top: 2px; color: var(--queue-secondary); font-size: 10px; line-height: 1.55; }
+.queue-online-other-notice { display: flex; padding: 11px 12px; align-items: flex-start; gap: 9px; border-left: 3px solid var(--queue-orange); color: var(--queue-orange); background: var(--queue-soft-orange); }
+.queue-online-other-notice > svg { margin-top: 1px; flex: 0 0 auto; }
+.queue-online-other-notice p { margin: 0; }
+.queue-online-other-notice strong, .queue-online-other-notice span { display: block; }
+.queue-online-other-notice strong { font-size: 11px; font-weight: 640; line-height: 1.45; }
+.queue-online-other-notice span { margin-top: 2px; color: var(--queue-secondary); font-size: 10px; line-height: 1.55; }
 .queue-online-capacity-notice { display: flex; padding: 11px 12px; align-items: flex-start; gap: 9px; border-left: 3px solid var(--queue-blue); color: var(--queue-blue); background: var(--queue-soft-blue); }
 .queue-online-capacity-notice > svg { margin-top: 1px; flex: 0 0 auto; }
 .queue-online-capacity-notice p { margin: 0; }
@@ -3274,6 +3901,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-online-actions button { min-height: 44px; border: 0; border-radius: 9px; color: var(--queue-text); background: var(--queue-position); cursor: pointer; font-size: 11px; font-weight: 590; }
 .queue-online-actions button.primary { color: #fff; background: var(--queue-blue); }
 .queue-online-actions button:disabled { color: var(--queue-tertiary); background: var(--queue-disabled); cursor: default; }
+.queue-online-other-button { margin-top: 0; border: 1px solid var(--queue-separator); }
 .queue-online-result { display: flex; min-height: 250px; padding: 24px 4px 4px; align-items: center; justify-content: center; flex-direction: column; text-align: center; }
 .queue-online-result-icon { display: grid; width: 48px; height: 48px; place-items: center; border-radius: 50%; color: var(--queue-blue); background: var(--queue-soft-blue); }
 .queue-online-result-icon.is-information { color: var(--queue-online); background: var(--queue-soft-online); }

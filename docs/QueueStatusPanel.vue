@@ -33,6 +33,7 @@ const QUEUE_ONLINE_JOIN_API_URL = import.meta.env.VITE_QUEUE_ONLINE_JOIN_API_URL
   QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'queue-online/join')
 const QUEUE_ONLINE_COMMAND_API_BASE = import.meta.env.VITE_QUEUE_ONLINE_COMMAND_API_BASE ||
   QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'queue-online/commands')
+const OPERATION_FEEDBACK_TTL_MS = 10_000
 const REFRESH_INTERVAL = 10000
 const SNAPSHOT_STALE_AFTER = 90000
 const ONLINE_COMMAND_POLL_INTERVAL = 1500
@@ -93,6 +94,7 @@ const detailActionPreference = ref('SOLO')
 const detailActionSubmitting = ref(false)
 const detailActionError = ref('')
 const detailActionNotice = ref('')
+const operationFeedback = ref([])
 const versionDialogVisible = ref(false)
 const clientVersions = ref(null)
 const clientVersionsLoading = ref(false)
@@ -140,6 +142,48 @@ let refreshTimer
 let clockTimer
 let onlineCommandTimer
 let detailActionTimer
+const operationFeedbackTimers = new Map()
+
+function addOperationFeedback(kind, title, detail, retry = false) {
+  const item = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    kind,
+    title,
+    detail,
+    retry
+  }
+  operationFeedback.value = [item, ...operationFeedback.value].slice(0, 3)
+  const timer = window.setTimeout(() => {
+    operationFeedbackTimers.delete(item.id)
+    operationFeedback.value = operationFeedback.value.filter((entry) => entry.id !== item.id)
+  }, OPERATION_FEEDBACK_TTL_MS)
+  operationFeedbackTimers.set(item.id, timer)
+  for (const [id, discardedTimer] of operationFeedbackTimers) {
+    if (!operationFeedback.value.some((entry) => entry.id === id)) {
+      window.clearTimeout(discardedTimer)
+      operationFeedbackTimers.delete(id)
+    }
+  }
+}
+
+function dismissOperationFeedback(id) {
+  const timer = operationFeedbackTimers.get(id)
+  if (timer) window.clearTimeout(timer)
+  operationFeedbackTimers.delete(id)
+  operationFeedback.value = operationFeedback.value.filter((entry) => entry.id !== id)
+}
+
+function clearOperationFeedback() {
+  for (const timer of operationFeedbackTimers.values()) window.clearTimeout(timer)
+  operationFeedbackTimers.clear()
+  operationFeedback.value = []
+}
+
+function retrySafeRefresh() {
+  // A retry only reads authoritative state; it never repeats a queued command.
+  loadQueue()
+  if (playerAccount.value) refreshLoggedInPlayerQueue()
+}
 
 const totalRegistrationCount = computed(() => (
   machines.value.reduce((total, machine) => total + machine.registrationCount, 0)
@@ -1704,6 +1748,11 @@ function finishDetailQueueAction(message, errorMessage = '') {
   detailActionMode.value = null
   detailActionNotice.value = message
   detailActionError.value = errorMessage
+  if (errorMessage) {
+    addOperationFeedback('error', '操作未完成', `${errorMessage} 请刷新最新状态后再重新确认。`, true)
+  } else if (message) {
+    addOperationFeedback('success', '操作已完成', message)
+  }
   refreshLoggedInPlayerQueue()
   loadQueue(true)
 }
@@ -2623,6 +2672,7 @@ onBeforeUnmount(() => {
   if (clockTimer) window.clearInterval(clockTimer)
   if (onlineCommandTimer) window.clearTimeout(onlineCommandTimer)
   if (detailActionTimer) window.clearTimeout(detailActionTimer)
+  clearOperationFeedback()
   window.removeEventListener('keydown', handleKeydown)
 })
 </script>
@@ -2723,7 +2773,7 @@ onBeforeUnmount(() => {
       <div class="queue-self-main">
         <span class="queue-self-eyebrow">我的排队</span>
         <h2>{{ activeSelfIdentity.displayId }}</h2>
-        <strong>{{ markedSelfStatusTitle() }}</strong>
+        <strong class="queue-self-status-badge">{{ markedSelfStatusTitle() }}</strong>
         <p>{{ markedSelfStatusDetail() }}</p>
         <div v-if="markedSelfLocation" class="queue-self-facts">
           <span><MapPin :size="13" aria-hidden="true" />{{ markedSelfLocation.label }}</span>
@@ -2741,6 +2791,23 @@ onBeforeUnmount(() => {
       </div>
       <button v-if="!accountSessionActive" class="queue-self-clear" type="button" @click.stop="clearMarkedSelf">取消标记</button>
       <span v-else class="queue-self-account-badge">已登录</span>
+    </section>
+
+    <section v-if="operationFeedback.length" class="queue-feedback" aria-live="polite">
+      <header>
+        <strong>最近操作</strong>
+        <button type="button" @click="clearOperationFeedback">清除</button>
+      </header>
+      <article v-for="feedback in operationFeedback" :key="feedback.id" :class="`is-${feedback.kind}`">
+        <div>
+          <strong>{{ feedback.title }}</strong>
+          <p>{{ feedback.detail }}</p>
+          <button v-if="feedback.retry" type="button" @click="retrySafeRefresh">刷新最新状态</button>
+        </div>
+        <button class="queue-feedback-dismiss" type="button" aria-label="关闭操作结果" title="关闭" @click="dismissOperationFeedback(feedback.id)">
+          <X :size="15" aria-hidden="true" />
+        </button>
+      </article>
     </section>
 
     <section v-if="hasSnapshot && activeView === 'queue'" class="queue-online-entry"
@@ -3709,11 +3776,25 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-self-eyebrow { color: var(--queue-secondary); font-size: 10px; font-weight: 600; }
 .queue-self h2 { margin: 1px 0 0; border: 0; font-size: 19px; font-weight: 650; line-height: 1.3; letter-spacing: 0; overflow-wrap: anywhere; }
 .queue-self-main > strong { display: block; margin-top: 7px; font-size: 13px; font-weight: 620; line-height: 1.45; }
+.queue-self-status-badge { width: fit-content; padding: 4px 7px; border-radius: 6px; color: var(--queue-blue); background: var(--queue-soft-blue); }
+.queue-self.is-warning .queue-self-status-badge { color: var(--queue-orange); background: var(--queue-soft-orange); }
+.queue-self.is-danger .queue-self-status-badge { color: var(--queue-red); background: var(--queue-soft-red); }
+.queue-self.is-online .queue-self-status-badge { color: var(--queue-online); background: var(--queue-soft-online); }
 .queue-self-main > p { margin: 3px 0 0; color: var(--queue-secondary); font-size: 11px; line-height: 1.6; }
 .queue-self-facts { display: flex; margin-top: 9px; flex-wrap: wrap; gap: 6px; }
 .queue-self-facts span { display: flex; padding: 4px 7px; align-items: center; gap: 4px; border-radius: 6px; color: var(--queue-secondary); background: color-mix(in srgb, var(--queue-card) 82%, transparent); font-size: 10px; }
 .queue-self-clear { padding: 7px 8px; border: 0; color: var(--queue-secondary); background: transparent; cursor: pointer; font-size: 11px; }
 .queue-self-account-badge { padding: 5px 7px; border-radius: 6px; color: var(--queue-blue); background: var(--queue-soft-blue); font-size: 10px; font-weight: 600; white-space: nowrap; }
+.queue-feedback { margin: 0 0 18px; }
+.queue-feedback > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; }
+.queue-feedback > header strong { color: var(--queue-secondary); font-size: 10px; font-weight: 650; }
+.queue-feedback > header button, .queue-feedback-dismiss { border: 0; color: var(--queue-tertiary); background: transparent; cursor: pointer; font-size: 10px; }
+.queue-feedback article { display: flex; margin-top: 6px; padding: 10px 11px; align-items: flex-start; justify-content: space-between; gap: 10px; border-left: 3px solid var(--queue-blue); background: var(--queue-soft-blue); }
+.queue-feedback article.is-error { border-color: var(--queue-orange); background: var(--queue-soft-orange); }
+.queue-feedback article strong, .queue-feedback article p { display: block; }
+.queue-feedback article strong { font-size: 11px; font-weight: 640; }
+.queue-feedback article p { margin: 3px 0 0; color: var(--queue-secondary); font-size: 10px; line-height: 1.5; }
+.queue-feedback article > div > button { margin-top: 7px; padding: 4px 7px; border: 1px solid var(--queue-separator); border-radius: 6px; color: var(--queue-text); background: var(--queue-card); cursor: pointer; font-size: 10px; }
 
 .queue-online-entry { display: grid; min-height: 66px; margin: 0 0 16px; padding: 11px 12px; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 11px; border: 1px solid color-mix(in srgb, var(--queue-online) 24%, var(--queue-separator)); border-radius: 11px; background: color-mix(in srgb, var(--queue-soft-online) 48%, var(--queue-card)); }
 .queue-online-entry.is-disabled { border-color: var(--queue-separator); background: var(--queue-card); }
@@ -3832,8 +3913,8 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-load-more { display: block; margin: 14px auto 0; }
 
 .queue-detail-backdrop { position: fixed; z-index: 10000; inset: 0; display: grid; padding: 18px; place-items: center; background: rgba(0, 0, 0, .42); }
-.queue-detail-dialog, .queue-confirm-dialog { --queue-card: #fff; --queue-position: #f5f5f7; --queue-text: #1d1d1f; --queue-secondary: #6e6e73; --queue-tertiary: #8e8e93; --queue-separator: #d2d2d7; --queue-blue: #007aff; --queue-soft-blue: #eaf3ff; --queue-orange: #b85c00; --queue-soft-orange: #fff1dc; --queue-online: #087f73; --queue-soft-online: #e8f7f4; width: min(100%, 480px); max-height: min(680px, calc(100vh - 36px)); padding: 20px; overflow-y: auto; border: 1px solid var(--queue-separator); border-radius: 16px; color: var(--queue-text); background: var(--queue-card); box-shadow: 0 20px 54px rgba(0, 0, 0, .22); }
-:global(html.dark .queue-detail-dialog), :global(html.dark .queue-confirm-dialog) { --queue-card: #1c1c1e; --queue-position: #242426; --queue-text: #f5f5f7; --queue-secondary: #a1a1a6; --queue-tertiary: #8e8e93; --queue-separator: #38383a; --queue-blue: #0a84ff; --queue-soft-blue: #142b44; --queue-orange: #ffb35c; --queue-soft-orange: #3b2b13; --queue-online: #63d8ca; --queue-soft-online: #143632; }
+.queue-detail-dialog, .queue-confirm-dialog { --queue-card: #fff; --queue-position: #f5f5f7; --queue-text: #1d1d1f; --queue-secondary: #6e6e73; --queue-tertiary: #8e8e93; --queue-separator: #d2d2d7; --queue-blue: #007aff; --queue-soft-blue: #eaf3ff; --queue-orange: #b85c00; --queue-soft-orange: #fff1dc; --queue-red: #c9342c; --queue-soft-red: #ffefee; --queue-online: #087f73; --queue-soft-online: #e8f7f4; width: min(100%, 480px); max-height: min(680px, calc(100vh - 36px)); padding: 20px; overflow-y: auto; border: 1px solid var(--queue-separator); border-radius: 16px; color: var(--queue-text); background: var(--queue-card); box-shadow: 0 20px 54px rgba(0, 0, 0, .22); }
+:global(html.dark .queue-detail-dialog), :global(html.dark .queue-confirm-dialog) { --queue-card: #1c1c1e; --queue-position: #242426; --queue-text: #f5f5f7; --queue-secondary: #a1a1a6; --queue-tertiary: #8e8e93; --queue-separator: #38383a; --queue-blue: #0a84ff; --queue-soft-blue: #142b44; --queue-orange: #ffb35c; --queue-soft-orange: #3b2b13; --queue-red: #ff6961; --queue-soft-red: #3b1716; --queue-online: #63d8ca; --queue-soft-online: #143632; }
 .queue-detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .queue-detail-header > div { min-width: 0; }
 .queue-detail-header h2, .queue-confirm-dialog h2 { margin: 0; border: 0; overflow-wrap: anywhere; font-size: 22px; font-weight: 640; line-height: 1.3; letter-spacing: 0; }
@@ -3874,7 +3955,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-detail-action-warning { margin: 12px 0 0; padding: 9px 10px; border-left: 3px solid var(--queue-orange); color: var(--queue-secondary); background: var(--queue-soft-orange); font-size: 10px; line-height: 1.5; }
 .queue-detail-action-buttons { display: grid; margin-top: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
 .queue-detail-action-buttons button, .queue-detail-action-confirm button { min-height: 40px; padding: 7px 9px; border: 1px solid var(--queue-separator); border-radius: 8px; color: var(--queue-text); background: var(--queue-position); cursor: pointer; font-size: 11px; line-height: 1.35; }
-.queue-detail-action-buttons button.is-danger, .queue-detail-action-confirm button.is-danger { color: var(--queue-red); }
+.queue-detail-action-buttons button.is-danger:not(:disabled), .queue-detail-action-confirm button.is-danger:not(:disabled) { color: var(--queue-red) !important; }
 .queue-detail-action-buttons button.is-unavailable { color: var(--queue-tertiary); background: var(--queue-disabled); }
 .queue-detail-action-buttons button:disabled, .queue-detail-action-confirm button:disabled { color: var(--queue-tertiary); background: var(--queue-disabled); cursor: default; }
 .queue-detail-action-title { display: block; margin-top: 13px; font-size: 12px; font-weight: 620; }
@@ -3887,7 +3968,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-detail-action-choices button:disabled { color: var(--queue-tertiary); background: var(--queue-disabled); cursor: default; }
 .queue-detail-action-confirm { display: grid; margin-top: 10px; grid-template-columns: 1fr 1.35fr; gap: 7px; }
 .queue-detail-action-confirm button.primary { border-color: var(--queue-blue); color: #fff; background: var(--queue-blue); }
-.queue-detail-action-confirm button.primary.is-danger { border-color: var(--queue-red); background: var(--queue-red); }
+.queue-detail-action-confirm button.primary.is-danger:not(:disabled) { border-color: var(--queue-red) !important; color: #fff !important; background: var(--queue-red) !important; }
 .queue-detail-action-error, .queue-detail-action-notice { margin: 9px 0 0; padding: 8px 9px; border-radius: 7px; font-size: 10px; line-height: 1.5; }
 .queue-detail-action-error { color: var(--queue-red); background: var(--queue-soft-red); }
 .queue-detail-action-notice { color: var(--queue-online); background: var(--queue-soft-online); }
